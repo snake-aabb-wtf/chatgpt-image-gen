@@ -53,6 +53,27 @@ def challenge_message(url: str, *, solved: bool) -> str:
         f"浏览器窗口已打开在该地址上，请在里面完成验证后重试。")
 
 
+#: 出错时值得打出来的响应头 —— 判断"边缘挑战 vs 应用层拒绝"全靠它们
+_DIAGNOSTIC_HEADERS = ("cf-mitigated", "cf-ray", "server", "content-type",
+                       "www-authenticate", "x-request-id")
+
+
+def describe_response(response: TransportResponse, limit: int = 300) -> str:
+    """把响应压成一行可诊断的摘要（状态码 + 关键头 + 正文片段）。
+
+    早先只打正文，而 ``f/conversation`` 被拒时正文是**空的** ——
+    结果错误信息成了"返回 403："后面什么都没有，完全没法查。
+    """
+    bits = [f"{name}={response.header(name)}"
+            for name in _DIAGNOSTIC_HEADERS if response.header(name)]
+    detail = str(response.status_code)
+    if bits:
+        detail += " [" + ", ".join(bits) + "]"
+    body = response.text[:limit].replace("\n", " ").strip()
+    detail += f" {body}" if body else " （空响应体）"
+    return detail
+
+
 @dataclass
 class TransportResponse:
     status_code: int
@@ -166,9 +187,11 @@ class HttpTransport:
                     content=response.content or b"")
                 if probe.looks_like_cloudflare_challenge():
                     raise CloudflareChallengeError(
-                        f"{url} 被 Cloudflare 挑战拦截（{response.status_code}）")
+                        f"{url} 被 Cloudflare 挑战拦截"
+                        f"（{describe_response(probe)}）")
                 raise TransportError(
-                    f"{url} 返回 {response.status_code}：{probe.text[:300]}")
+                    f"{url} 返回 {describe_response(probe)}",
+                    status_code=response.status_code)
             for line in response.iter_lines():
                 yield line.decode("utf-8", errors="replace") \
                     if isinstance(line, bytes) else line
@@ -218,7 +241,8 @@ class BrowserTransport:
                 f"{url} 在浏览器上下文里仍被 Cloudflare 拦截")
         if not response.ok:
             raise TransportError(
-                f"{url} 返回 {response.status_code}：{response.text[:300]}")
+                f"{url} 返回 {describe_response(response)}",
+                status_code=response.status_code)
         yield from response.text.splitlines()
 
 

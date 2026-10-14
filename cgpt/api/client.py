@@ -24,6 +24,7 @@ from cgpt.errors import (
     CgptError,
     ImageGenUnavailableError,
     NoImageProducedError,
+    SentinelRejectedError,
     SessionExpiredError,
     TransportError,
     UnsafeDownloadURLError,
@@ -299,7 +300,18 @@ class ChatGptWebClient:
         lines = self.transport.stream_lines(
             "POST", self._url("/backend-api/f/conversation"),
             headers=self._headers(extra), json=body, timeout=timeout)
-        findings = consume_sse(lines)
+        try:
+            findings = consume_sse(lines)
+        except TransportError as exc:
+            # 403 且不是 CF 边缘挑战 → 服务端不受理这次发送。
+            # 最常见成因就是准入令牌已被上一次请求消耗（令牌是一次性的）。
+            if getattr(exc, "status_code", None) == 403:
+                raise SentinelRejectedError(
+                    "服务端拒绝了这次发送（403）。\n"
+                    "最常见的原因是准入令牌已被上一次请求消耗 —— "
+                    "三条 openai-sentinel-* 是**一次性**的，同一批只能用一次。\n"
+                    f"详情：{exc}") from exc
+            raise
         if findings.server_errors:
             raise CgptError(
                 "服务端在事件流里报了错：" + "; ".join(findings.server_errors[:3]))

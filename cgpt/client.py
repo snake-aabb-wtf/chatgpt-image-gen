@@ -38,7 +38,7 @@ from cgpt.auth.store import (
     save_credentials,
 )
 from cgpt.config import Settings
-from cgpt.errors import SessionExpiredError
+from cgpt.errors import SentinelRejectedError
 from cgpt.models import Credentials, GenerationResult, SentinelTokens
 
 #: 哨兵令牌剩余寿命低于这个值就视为需要刷新（服务端 540 秒，留 60 秒余量）
@@ -165,17 +165,39 @@ class Client:
         self.log("已关闭浏览器窗口（需要时会自动重新打开）")
 
     def _sentinel_is_fresh(self) -> bool:
+        """能否直接拿现有令牌发请求。
+
+        除了过期，还必须检查 ``consumed`` —— 哨兵令牌是**一次性**的
+        （见 ``SentinelTokens`` 的说明）。忽略这一点就会"第一次成功、
+        第二次 403"，而且看起来像随机故障。
+        """
         tokens = self.credentials.sentinel
         if tokens is None or not tokens.chat_requirements:
+            return False
+        if tokens.consumed:
             return False
         return tokens.age() < (480.0 - SENTINEL_REFRESH_MARGIN)
 
     def ensure_sentinel(self) -> None:
         if not self._sentinel_is_fresh():
-            if self.credentials.sentinel is not None:
-                self.log(f"准入令牌已过 {self.credentials.sentinel.age():.0f} 秒，"
-                         f"重新获取…")
+            tokens = self.credentials.sentinel
+            if tokens is not None:
+                if tokens.consumed:
+                    self.log("准入令牌已被上一次发送消耗（令牌是一次性的），"
+                             "重新获取…")
+                else:
+                    self.log(f"准入令牌已过 {tokens.age():.0f} 秒，重新获取…")
             self.refresh_sentinel()
+
+    def _mark_sentinel_consumed(self) -> None:
+        """把当前这批令牌标记为已用掉。
+
+        只要向 ``f/conversation`` 发过一次（无论成功与否），服务端就见过它们了，
+        不能再赌它还有效 —— 重取的代价只是几秒，猜错的代价是一次 403。
+        """
+        tokens = self.credentials.sentinel
+        if tokens is not None and not tokens.consumed:
+            tokens.consumed = True
 
     # --- 传输层 -------------------------------------------------------
 
@@ -271,16 +293,30 @@ class Client:
                        refresh_sentinel: bool = True) -> GenerationResult:
         """生成图片并落盘。
 
-        会自动确保准入令牌新鲜；若服务端返回会话失效，**不自动重登**
-        （那会反复触发风控），而是抛 ``SessionExpiredError`` 让调用方决定。
+        **每次都会取一批新的准入令牌** —— 哨兵令牌是一次性的，不能跨次复用
+        （见 ``SentinelTokens``）。所以每跑一次生图都会短暂开一下浏览器。
+
+        若服务端返回会话失效，**不自动重登**（那会反复触发风控），
+        而是抛 ``SessionExpiredError`` 让调用方决定。
         """
         if refresh_sentinel:
             self.ensure_sentinel()
         try:
             return _generate_image(self.web, prompt, out, timeout=timeout,
                                    poll_interval=poll_interval, note=self.log)
-        except SessionExpiredError:
-            raise
+        except SentinelRejectedError:
+            # 兜底：万一令牌在我们不知情的情况下被消耗了（比如同一份凭据被
+            # 另一个进程用掉），重取一批再试一次。发送被 403 拒绝说明消息
+            # **没有**被受理，重试不会重复消耗额度。
+            if not refresh_sentinel:
+                raise
+            self.log("发送被拒（403），重取准入令牌后再试一次…")
+            self.refresh_sentinel()
+            return _generate_image(self.web, prompt, out, timeout=timeout,
+                                   poll_interval=poll_interval, note=self.log)
+        finally:
+            # 无论成败都标记消耗 —— 服务端已经见过这批令牌了
+            self._mark_sentinel_consumed()
 
     def close(self) -> None:
         if self._browser is not None and self._owns_browser:

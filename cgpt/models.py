@@ -28,14 +28,24 @@ class SentinelTokens(BaseModel):
 
     它们**必须成套使用**——同一次 `chat-requirements/finalize` 产出，
     混用不同轮的令牌会被服务端拒绝（docs/02 §4.4 专门记录过这个坑）。
+
+    ⚠️ **而且是一次性的**（本项目实测确认）：同一批令牌只能用于一次
+    ``f/conversation``，第二次复用会得到 403（空响应体、JSON content-type，
+    不是 Cloudflare 边缘挑战）。已验证不是频率限制 —— 刚成功后 47 秒，
+    只换令牌就能再次成功。所以 ``consumed`` 一旦置位就不能再拿去发请求。
     """
 
     chat_requirements: str  # → openai-sentinel-chat-requirements-token
     proof: str              # → openai-sentinel-proof-token
     turnstile: str          # → openai-sentinel-turnstile-token
     issued_at: float        # 本地记录时刻（服务端 expire_at 未落盘，用 TTL 近似）
+    #: 是否已被一次发送消耗掉。置位后必须重新从浏览器取，不能复用。
+    consumed: bool = False
 
     def is_fresh(self, now: float | None = None) -> bool:
+        """是否还能直接拿去发请求（既没过期、也没被用过）。"""
+        if self.consumed:
+            return False
         now = time.time() if now is None else now
         return (now - self.issued_at) < SENTINEL_TTL_SECONDS
 

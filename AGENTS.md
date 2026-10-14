@@ -68,6 +68,7 @@ python -m pytest tests/ -q > /dev/null 2>&1; echo $?   # 0 = 通过
 | 5 | 生成物**不得带时间戳** | `cgpt/data/har_vectors.json` 每次重建都产生无意义 diff，掩盖真实变化 |
 | 6 | 不要"简化"成纯 HTTP 登录 | 见 §3.1 —— 协议层就被堵死，改不出来 |
 | 7 | 流已开始产出后**不得重发** | 重复发送消息 = 重复消耗生图额度 |
+| 8 | 哨兵令牌**不得跨次复用** | 见 §3.8 —— 同一批 `openai-sentinel-*` 只能用一次，第二次必然 403 |
 
 ---
 
@@ -169,6 +170,44 @@ primary 被拦 → fallback 重发 → 还被拦
 * 库的默认行为是 `challenge_prompt=None` → **不等待、直接抛错**。只有 CLI 与 GUI
   传入了交互实现。GUI 那边走 `_emit("challenge", (url, queue))` + 主线程弹框，
   因为 Tk 不是线程安全的而 Playwright 必须留在工作线程。
+
+### 3.8 哨兵令牌是**一次性**的（本项目实测修正）
+
+**故障现象**：第一次生图正常，第二次 403。
+
+**三次真实生图的对照实验**（每次都记录 HTTP 细节）：
+
+| 实验 | 条件 | 结果 |
+|------|------|------|
+| A | 全新令牌，首次使用 | ✅ 成功 |
+| B | **同一批**令牌，47 秒后再用 | ❌ 403 |
+| C | **只换了令牌**，49 秒后再来 | ✅ 成功 |
+
+C 是关键对照：与 B 的时间间隔一样近，唯一区别是令牌是新的 → **不是频率限制**。
+
+403 的特征：`f/conversation` 返回 403、**响应体为空**、`content-type: application/json`、
+没有 `cf-mitigated` → **应用层拒绝**，不是 Cloudflare 边缘挑战（所以 `looks_like_cloudflare_challenge()`
+返回 False，不会走 CF 回退，别指望回退能救）。
+
+**这条修正了 `docs/02` §4.5 的读法**：那里的证据是"令牌签发 55 秒后被**另一个页面用了一次**"，
+说明令牌是**人/会话级**（跨页面共享）且未过期的批次仍有效 —— 但**不等于可以重复使用**。
+真实客户端之所以看起来"复用"，是因为页面在**后台预刷新**，每次发送实际用的是新批次。
+
+实现要点：
+
+```
+SentinelTokens.consumed   用过就置位（核心不变量）
+_sentinel_is_fresh()      过期 **或** consumed → 都要重取
+generate_image()          每次先 ensure_sentinel()（必然重取）
+                          finally 里无条件 _mark_sentinel_consumed()
+                          捕获 SentinelRejectedError → 重取一次再试（只一次）
+TransportError.status_code  403 判断走状态码，不要匹配错误文本
+```
+
+**代价（已知且接受）**：每次生图都会开一次浏览器（约 8 秒）。
+想要省这一步就得让令牌可复用 —— 而那是服务端说了算，做不到。
+
+回归测试见 `tests/test_sentinel_single_use.py`。
 
 ---
 

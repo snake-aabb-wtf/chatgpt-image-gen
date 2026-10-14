@@ -48,7 +48,26 @@ class CloudflareChallengeError(CgptError):
 
 
 class TransportError(CgptError):
-    """网络层失败（DNS、连接、超时、TLS 等），与业务状态码无关。"""
+    """网络层失败（DNS、连接、超时、TLS 等），与业务状态码无关。
+
+    ``status_code`` 让调用方能**按状态码**判断，而不是去匹配错误文本 ——
+    字符串匹配太脆，改一个字就失效。
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class SentinelRejectedError(CgptError):
+    """服务端拒绝了这次对话发送（通常是 403）。
+
+    实测确认的成因：**三条哨兵令牌是一次性的** —— 同一批 ``openai-sentinel-*``
+    只能用于一次 ``f/conversation``。第二次复用必然 403
+    （响应体为空、``content-type: application/json``，不是 Cloudflare 边缘挑战）。
+
+    已验证不是频率限制：刚成功后 47 秒，只换令牌就能再次成功。
+    """
 
 
 class UnsafeDownloadURLError(CgptError):
