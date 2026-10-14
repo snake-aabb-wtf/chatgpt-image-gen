@@ -59,6 +59,26 @@ def main() -> int:
     def check(name: str, ok: bool, detail: str = "") -> None:
         checks.append((name, bool(ok), detail))
 
+    def empty_prompt_is_blocked() -> bool:
+        """空提示词必须被拦下，且**不能真的提交任务**（否则白花一次额度）。
+
+        把弹框与提交都换成记录器 —— 否则这里会弹出模态窗口把冒烟测试挂住。
+        """
+        warned: list[str] = []
+        submitted: list[str] = []
+
+        original_warning = gui.messagebox.showwarning
+        original_submit = app._submit
+        gui.messagebox.showwarning = lambda title, *a, **kw: warned.append(title)
+        app._submit = lambda name, func: submitted.append(name)
+        try:
+            app.prompt_text.delete("1.0", "end")
+            app.on_generate()
+        finally:
+            gui.messagebox.showwarning = original_warning
+            app._submit = original_submit
+        return bool(warned) and not submitted
+
     try:
         app = gui.GuiApp(settings=settings, account_path=account_path)
     except Exception as exc:  # noqa: BLE001
@@ -79,8 +99,11 @@ def main() -> int:
               f"{app.root.winfo_width()}x{app.root.winfo_height()}")
         check("账号自动填充", app.account_var.get() == LINE)
         check("账号默认掩码", app.account_entry.cget("show") == "•")
-        check("提示词已预填", bool(app.prompt_text.get("1.0", "end").strip()),
-              app.prompt_text.get("1.0", "end").strip())
+        check("提示词留空（不预填示例）",
+              app.prompt_text.get("1.0", "end").strip() == "",
+              repr(app.prompt_text.get("1.0", "end")))
+        check("空提示词会被拦下（不白花额度）",
+              empty_prompt_is_blocked())
         check("输出目录提示可见",
               "output" in str(app.generate_button.master.winfo_children()[0].cget("text")),
               str(app.generate_button.master.winfo_children()[0].cget("text")))

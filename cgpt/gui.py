@@ -230,7 +230,9 @@ class GuiApp:
 
         self.prompt_text = tk.Text(frame, height=3, wrap="word", undo=True)
         self.prompt_text.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.prompt_text.insert("1.0", "生成一张地球图片")
+        # 刻意**不预填**任何提示词：预填的示例很容易被当成"就这么用"，
+        # 用户一进来点「生成图片」就白花一次额度。留空 + on_generate 的空值
+        # 校验，比给个看起来能直接用的默认值更诚实。
         # Ctrl+Enter 发送（单独 Enter 留给换行）
         self.prompt_text.bind("<Control-Return>",
                               lambda _e: (self.on_generate(), "break")[1])
