@@ -1,5 +1,4 @@
 {
-  "generated_at": "2026-10-14T21:58:10+0800",
   "note": "由 tools/build_har_vectors.py 从 legacy/har/ 现场提取。expected_* 来自 docs/ 的独立分析结论，用作自证的对照真值。",
   "pow": [
     {

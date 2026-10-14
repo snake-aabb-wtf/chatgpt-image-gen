@@ -8,6 +8,3 @@
 *.png binary
 *.jpg binary
 *.webp binary
-
-# 抓包里的 JSON 真值文件与载荷字面量很大，diff 出来没有意义
-cgpt/data/har_vectors.json -diff

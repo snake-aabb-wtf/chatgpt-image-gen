@@ -175,7 +175,8 @@ def build() -> dict[str, Any]:
     loaded = _load(set(TARGET_ENTRIES))
 
     vectors: dict[str, Any] = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        # 刻意**不**写生成时间戳：这个文件是要提交的生成物，带上时间戳会导致
+        # 每次重建都产生无意义 diff，掩盖真正的内容变化。
         "note": ("由 tools/build_har_vectors.py 从 legacy/har/ 现场提取。"
                  "expected_* 来自 docs/ 的独立分析结论，用作自证的对照真值。"),
         "pow": [],
