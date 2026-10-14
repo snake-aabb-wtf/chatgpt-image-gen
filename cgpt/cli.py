@@ -4,7 +4,7 @@
 
     python -m cgpt login     --email … --password … --totp-secret …
     python -m cgpt whoami
-    python -m cgpt generate  "生成一张地球图片" --out earth.png
+    python -m cgpt generate  "生成一张地球图片"
     python -m cgpt sentinel  decode <令牌>
     python -m cgpt sentinel  crack  <blob>
     python -m cgpt selftest
@@ -183,15 +183,18 @@ def whoami(ctx: click.Context) -> None:
 
 @main.command()
 @click.argument("prompt")
-@click.option("--out", default=None, help="输出文件路径（默认按会话 id 命名）")
 @click.option("--timeout", default=None, type=float,
               help="等待出图的总秒数（默认 720）")
 @click.option("--no-refresh-sentinel", is_flag=True,
               help="不自动刷新准入令牌（调试用）")
 @click.pass_context
-def generate(ctx: click.Context, prompt: str, out: str | None,
-             timeout: float | None, no_refresh_sentinel: bool) -> None:
-    """请求生成图片并落盘。"""
+def generate(ctx: click.Context, prompt: str, timeout: float | None,
+             no_refresh_sentinel: bool) -> None:
+    """请求生成图片并落盘。
+
+    输出固定落在 output/ 目录，文件名随机（后缀跟图片格式走），
+    实际路径见下方 JSON 里的 images[].path。
+    """
     from cgpt.client import Client
 
     settings = _settings(ctx)
@@ -199,7 +202,7 @@ def generate(ctx: click.Context, prompt: str, out: str | None,
         with Client.from_credentials(settings=settings, log=_echo,
                                      challenge_prompt=_challenge_prompt) as client:
             result = client.generate_image(
-                prompt, out=out, timeout=timeout,
+                prompt, timeout=timeout,
                 refresh_sentinel=not no_refresh_sentinel)
             client.save()          # 刷新后的哨兵令牌一并存下
     except CgptError as exc:

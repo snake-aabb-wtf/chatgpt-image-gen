@@ -22,6 +22,7 @@ from cgpt.api.image import (
     collect_assets,
     generate_image,
     probe_image,
+    random_output_path,
 )
 from cgpt.api.sse import (
     StreamFindings,
@@ -338,8 +339,9 @@ def _credentials() -> Credentials:
     )
 
 
-def _client(transport: FakeTransport) -> ChatGptWebClient:
-    return ChatGptWebClient(_credentials(), transport, Settings())
+def _client(transport: FakeTransport,
+            settings: Settings | None = None) -> ChatGptWebClient:
+    return ChatGptWebClient(_credentials(), transport, settings or Settings())
 
 
 def _accounts_check_payload(*, image_gen: bool = True,
@@ -554,6 +556,133 @@ def test_generate_image_rejects_non_image_payload(tmp_path: Path) -> None:
 
     with pytest.raises(CgptError, match="不是已知图片格式"):
         generate_image(_client(transport), "画个地球", out=tmp_path / "e.png")
+
+
+# --- 输出路径：默认随机落到 output/ ---------------------------------------
+
+
+def _ready_transport(asset_part: dict[str, Any] | None = None) -> FakeTransport:
+    """一个"能跑完生图"的假传输层（只差落盘那一步）。"""
+    transport = FakeTransport()
+    for contains, status, payload in _accounts_check_payload():
+        transport.add_json(contains, status, payload)
+    transport.add_stream("f/conversation",
+                         _real_sse_lines(asset_part) if asset_part
+                         else _real_sse_lines())
+    transport.add_json("files/download", 200, {
+        "download_url": "https://chatgpt.com/backend-api/estuary/content?sig=x"})
+    transport.add_json("estuary/content", 200, PNG_1X1)
+    return transport
+
+
+def test_random_output_path_uses_dir_and_mime_extension(tmp_path: Path) -> None:
+    path = random_output_path(tmp_path, "image/png")
+    assert path.parent == tmp_path
+    assert path.suffix == ".png"
+    assert path.stem                              # 有名字
+
+
+@pytest.mark.parametrize("mime,expected", [
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/webp", ".webp"),
+    ("", ".bin"),                                 # 未知格式兜底
+])
+def test_random_output_path_extension_follows_mime(tmp_path: Path, mime: str,
+                                                   expected: str) -> None:
+    assert random_output_path(tmp_path, mime).suffix == expected
+
+
+def test_random_output_path_is_actually_random(tmp_path: Path) -> None:
+    names = {random_output_path(tmp_path, "image/png").name for _ in range(50)}
+    assert len(names) == 50, "50 次应当得到 50 个不同的名字"
+
+
+def test_random_output_path_avoids_existing_files(tmp_path: Path,
+                                                  monkeypatch) -> None:
+    """重名要重试 —— 把随机源钉死来构造一次碰撞。"""
+    calls = {"n": 0}
+
+    def fake_token_hex(_n: int) -> str:
+        calls["n"] += 1
+        return "deadbeefdeadbeef" if calls["n"] == 1 else "cafebabecafebabe"
+
+    monkeypatch.setattr("cgpt.api.image.secrets.token_hex", fake_token_hex)
+    (tmp_path / "deadbeefdeadbeef.png").write_bytes(b"already here")
+
+    path = random_output_path(tmp_path, "image/png")
+
+    assert path.name == "cafebabecafebabe.png"
+    assert calls["n"] == 2
+
+
+def test_generate_image_defaults_into_output_dir(tmp_path: Path) -> None:
+    """不给 out 时：落到 Settings.output_dir，文件名随机。"""
+    settings = Settings(output_dir=tmp_path / "out")
+    transport = _ready_transport()
+
+    result = generate_image(_client(transport, settings), "画个地球")
+
+    image = result.primary
+    assert image.path.parent == tmp_path / "out"
+    assert image.path.suffix == ".png"
+    assert image.path.exists()
+    assert image.path.read_bytes() == PNG_1X1
+    # 文件名不该带会话 id 或提示词
+    assert "cid-1" not in image.path.name
+    assert "地球" not in image.path.name
+
+
+def test_generate_image_default_names_differ_between_runs(tmp_path: Path) -> None:
+    settings = Settings(output_dir=tmp_path / "out")
+
+    first = generate_image(_client(_ready_transport(), settings), "画个地球")
+    second = generate_image(_client(_ready_transport(), settings), "画个地球")
+
+    assert first.primary.path != second.primary.path
+    assert first.primary.path.exists() and second.primary.path.exists()
+
+
+def test_generate_image_multi_assets_get_distinct_random_names(tmp_path: Path) -> None:
+    settings = Settings(output_dir=tmp_path / "out")
+    transport = _ready_transport()
+    transport.add_stream(
+        "f/conversation",
+        _real_sse_lines(extra_events=(_extra_asset_event(_second_asset_part()),)))
+
+    result = generate_image(_client(transport, settings), "画两张")
+
+    assert len(result.images) == 2
+    names = {image.path.name for image in result.images}
+    assert len(names) == 2, "两张图应当各自随机命名，而不是加 _2 后缀"
+    assert all(image.path.exists() for image in result.images)
+
+
+def test_explicit_out_still_honoured_as_library_override(tmp_path: Path) -> None:
+    """``out`` 只是给库调用方留的覆盖口，CLI 与 GUI 都不暴露它。"""
+    settings = Settings(output_dir=tmp_path / "out")
+    target = tmp_path / "chosen.png"
+
+    result = generate_image(_client(_ready_transport(), settings), "画个地球",
+                            out=target)
+
+    assert result.primary.path == target
+    assert target.exists()
+    assert not (tmp_path / "out").exists(), "显式给路径时不该再往 output_dir 写"
+
+
+def test_explicit_out_with_multiple_assets_still_numbers_them(tmp_path: Path) -> None:
+    settings = Settings(output_dir=tmp_path / "out")
+    transport = _ready_transport()
+    transport.add_stream(
+        "f/conversation",
+        _real_sse_lines(extra_events=(_extra_asset_event(_second_asset_part()),)))
+    target = tmp_path / "chosen.png"
+
+    result = generate_image(_client(transport, settings), "画两张", out=target)
+
+    assert result.images[0].path == target
+    assert result.images[1].path == tmp_path / "chosen_2.png"
 
 
 # --- 图片头解析 ----------------------------------------------------------

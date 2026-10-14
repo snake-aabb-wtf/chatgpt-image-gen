@@ -5,9 +5,11 @@
     from cgpt import Client
 
     client = Client.from_credentials(".cgpt/credentials.json")
-    result = client.generate_image("生成一张地球图片", out="earth.png")
+    result = client.generate_image("生成一张地球图片")
+    print(result.primary.path)      # output/3f2a9c1b4d5e4f6a.png（文件名随机）
 
 用法（CLI）：``python -m cgpt --help``
+用法（GUI）：``python -m cgpt gui``
 """
 
 from __future__ import annotations

@@ -6,12 +6,16 @@
 
     client = Client.login(email=..., password=..., totp_secret=...)
     client.save(".cgpt/credentials.json")
-    result = client.generate_image("生成一张地球图片", out="earth.png")
+    result = client.generate_image("生成一张地球图片")
+    print(result.primary.path)      # output/<随机名>.png
 
 或者复用已登录的凭据::
 
     client = Client.from_credentials(".cgpt/credentials.json")
-    client.generate_image("...", out="a.png")
+    client.generate_image("...")
+
+输出固定落在 ``Settings.output_dir``（默认 ``output/``）下，文件名随机、
+后缀跟图片格式走。需要指定文件名时才传 ``out=``（只给库调用方留的口子）。
 """
 
 from __future__ import annotations

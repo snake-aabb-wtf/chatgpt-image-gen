@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import os
 import queue
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 
@@ -72,7 +73,6 @@ from cgpt.errors import CgptError  # noqa: E402
 from cgpt.models import GenerationResult  # noqa: E402
 
 WINDOW_TITLE = "ChatGPT 生图工具"
-DEFAULT_OUTPUT = "output/earth.png"
 PREVIEW_BOX = (430, 430)
 MAX_LOG_LINES = 2000
 
@@ -237,17 +237,19 @@ class GuiApp:
 
         row_frame = ttk.Frame(frame)
         row_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        row_frame.columnconfigure(1, weight=1)
+        row_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(row_frame, text="输出").grid(row=0, column=0, padx=(0, 6))
-        self.output_var = tk.StringVar(value=DEFAULT_OUTPUT)
-        ttk.Entry(row_frame, textvariable=self.output_var).grid(row=0, column=1,
-                                                                sticky="ew")
-        ttk.Button(row_frame, text="浏览…", width=8,
-                   command=self.on_browse).grid(row=0, column=2, padx=(6, 0))
+        # 不再让用户指定路径：一律落到 output/ 下、文件名随机。
+        # 文件名随机之后不好找文件，所以配一个"打开输出目录"。
+        ttk.Label(row_frame,
+                  text=f"输出：{self.settings.output_dir}\\（文件名随机）"
+                  ).grid(row=0, column=0, sticky="w")
+        self.open_dir_button = ttk.Button(row_frame, text="打开输出目录", width=13,
+                                          command=self.on_open_output_dir)
+        self.open_dir_button.grid(row=0, column=1, padx=(6, 0))
         self.generate_button = ttk.Button(row_frame, text="生成图片", width=12,
                                           command=self.on_generate)
-        self.generate_button.grid(row=0, column=3, padx=(6, 0))
+        self.generate_button.grid(row=0, column=2, padx=(6, 0))
 
     def _build_result_section(self, parent: ttk.Frame, *, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="结果", padding=8)
@@ -488,15 +490,27 @@ class GuiApp:
         else:
             self._append_log("本地没有保存过账号")
 
-    def on_browse(self) -> None:
-        current = Path(self.output_var.get() or DEFAULT_OUTPUT)
-        chosen = filedialog.asksaveasfilename(
-            parent=self.root, title="选择保存位置",
-            defaultextension=".png", initialfile=current.name,
-            initialdir=str(current.parent if current.parent.exists() else Path.cwd()),
-            filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")])
-        if chosen:
-            self.output_var.set(chosen)
+    def on_open_output_dir(self) -> None:
+        """打开输出目录。
+
+        文件名随机之后，光看日志里的路径不够方便 —— 这个按钮是那次改动的配套。
+        """
+        target = Path(self.settings.output_dir)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._append_log(f"创建输出目录失败：{exc}")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(target))          # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+            self._append_log(f"已打开输出目录：{target.resolve()}")
+        except Exception as exc:  # noqa: BLE001 - 打不开不该影响别的功能
+            self._append_log(f"打不开输出目录（{exc!r}），路径是：{target.resolve()}")
 
     def on_login(self) -> None:
         raw = self.account_var.get()
@@ -524,9 +538,7 @@ class GuiApp:
             messagebox.showwarning("提示词为空", "请先输入提示词。",
                                    parent=self.root)
             return
-        output = self.output_var.get().strip() or DEFAULT_OUTPUT
-        self._submit("生成图片",
-                     lambda ctx: self._task_generate(ctx, prompt, output))
+        self._submit("生成图片", lambda ctx: self._task_generate(ctx, prompt))
 
     # ------------------------------------------------------------------
     # 任务实现（在工作线程里执行）
@@ -560,14 +572,14 @@ class GuiApp:
                 log=self._log)
         self._emit("session", self._probe_session(ctx.client))
 
-    def _task_generate(self, ctx: _Context, prompt: str, output: str) -> None:
+    def _task_generate(self, ctx: _Context, prompt: str) -> None:
         from cgpt.client import Client
 
         if ctx.client is None:
             ctx.client = Client.from_credentials(
                 settings=self.settings, challenge_prompt=self._challenge_prompt,
                 log=self._log)
-        result = ctx.client.generate_image(prompt, out=output)
+        result = ctx.client.generate_image(prompt)
         ctx.client.save()        # 把刷新后的哨兵令牌一并存下
         self._emit("result", result)
         self._emit("session", self._probe_session(ctx.client))
@@ -638,5 +650,5 @@ def launch(settings: Settings | None = None) -> None:
             f"无法启动图形界面（{exc}）。\n"
             "如果这是无桌面环境（例如纯 SSH / 容器），请改用命令行：\n"
             "  python -m cgpt login\n"
-            "  python -m cgpt generate \"生成一张地球图片\" --out output/earth.png"
+            "  python -m cgpt generate \"生成一张地球图片\""
         ) from exc

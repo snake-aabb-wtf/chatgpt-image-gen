@@ -13,7 +13,7 @@ GUI 里粘贴一行 `邮箱----密码----2FA密钥` 即可登录，再填提示�
 ```bash
 python -m cgpt login    --email you@example.com        # 或者走命令行
 python -m cgpt whoami                                   # 校验会话 / 看账号能力
-python -m cgpt generate "生成一张地球图片" --out earth.png   # 生图
+python -m cgpt generate "生成一张地球图片"                # 生图 → output/<随机名>.png
 python -m cgpt selftest                                 # 离线自证（不联网）
 ```
 
@@ -93,7 +93,7 @@ python -m cgpt gui
 │                                    [校验会话] [重新登录]      │
 ├─ 提示词 ────────────────────────────────────────────────────┤
 │ [生成一张地球图片                                  ]          │
-│ 输出 [output/earth.png        ] [浏览…]        [生成图片]     │
+│ 输出：output\（文件名随机）  [打开输出目录]   [生成图片]     │
 ├─ 结果 ──────────────────────────────────────────────────────┤
 │ ┌──────────────┐  ┌──────────────────────────────────────┐  │
 │ │   图片预览    │  │ 日志（实时滚动）                      │  │
@@ -152,8 +152,12 @@ python -m cgpt login
 ### 3.2 生图
 
 ```bash
-python -m cgpt generate "生成一张地球图片" --out output/earth.png
+python -m cgpt generate "生成一张地球图片"
 ```
+
+**输出不需要你操心**：一律落到 `output/` 目录，文件名随机（16 位十六进制），
+后缀跟图片实际格式走（PNG → `.png`）。实际路径在下面的 JSON 里。
+GUI 里对应一个「打开输出目录」按钮，省得你去翻随机文件名。
 
 输出 JSON（`stdout`；日志走 `stderr`，方便管道）：
 
@@ -162,7 +166,7 @@ python -m cgpt generate "生成一张地球图片" --out output/earth.png
   "conversation_id": "6acf78a3-...",
   "title": "生成地球图片",
   "images": [{
-    "path": "output\\earth.png",
+    "path": "output\\3f2a9c1b4d5e4f6a.png",
     "width": 1254, "height": 1254, "size_bytes": 2711942,
     "mime_type": "image/png",
     "asset_pointer": "sediment://file_0000000092a482088cc65529e4b4cd58"
@@ -173,6 +177,10 @@ python -m cgpt generate "生成一张地球图片" --out output/earth.png
 
 `notes` 记录"下到了图但元数据对不上"这类非致命差异；为空表示字节数与宽高全部与 `image_asset_pointer` 元数据一致。
 
+> 想换目录就改 `Settings.output_dir`（默认 `output/`）。
+> 需要指定**文件名**时，库调用可以传 `out=`，但 CLI 与 GUI 都不暴露它 ——
+> 日常使用不该被这个问题打断。
+
 ### 3.3 作为库
 
 ```python
@@ -180,7 +188,7 @@ from cgpt import Client
 
 # 复用已登录的凭据
 client = Client.from_credentials(".cgpt/credentials.json")
-result = client.generate_image("生成一张地球图片", out="earth.png")
+result = client.generate_image("生成一张地球图片")
 print(result.primary.path, result.primary.width, result.primary.height)
 
 # 或者先登录一次
@@ -256,7 +264,7 @@ python tools/build_har_vectors.py
 
 * **必须有真实浏览器**：`cf_clearance` 是 `Partitioned` 的，`t`/`turnstile` 的密钥随未解开的 `dx` 下发。纯 HTTP 登录这条路在协议层就被堵死，本工具不假装能绕。
 * **生图由服务端决定**：请求体里没有 `image_gen`/`tools` 字段，是否出图取决于服务端 feature 开关 + 模型对意图的判断。没出图时抛 `NoImageProducedError`，**不会伪造成功**。
-* **会消耗账号额度**：一次 `--out` 就是一次真实生图（实测剩余额度 24 → 22）。
+* **会消耗账号额度**：每跑一次 `generate` 就是一次真实生图（实测剩余额度 24 → 22）。
 * **登录页改版会失败**：失败时会把截图 + HTML + 可见文本存到 `.cgpt/debug/`，据此可快速修选择器。建议加 `--headed` 人工观察。
 * **未做**：本地 HTTP 服务 / OpenAI 兼容反代、多账号池、文件上传、SSE 文本流式展示、令牌后台续期守护。
 

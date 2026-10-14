@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,11 +110,35 @@ def _probe_webp(data: bytes) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _target_path(base: Path, index: int, mime: str, asset: ImageAsset) -> Path:
-    """第 0 张用调用方给的名字；多张时加序号后缀。"""
+#: 随机文件名的熵：8 字节 = 16 个十六进制字符。64 位空间下碰撞概率可忽略，
+#: 但仍然会检查一次重名（见 ``random_output_path``）—— 便宜且让保证显式。
+#: 默认目录由 ``Settings.output_dir``（默认 ``output/``）决定。
+RANDOM_NAME_BYTES = 8
+
+
+def random_output_path(output_dir: Path | str, mime: str) -> Path:
+    """在 ``output_dir`` 下生成一个随机文件名，后缀跟 MIME 走。
+
+    文件名刻意不带语义（不含提示词、会话 id、时间戳）：提示词可能很长或含
+    不适合做文件名的字符，而随机会话 id 既不美观也不比随机数更好认。
+    需要按时间排序的话，用文件系统的修改时间即可。
+    """
+    extension = _EXTENSION_BY_MIME.get(mime or "", ".bin")
+    directory = Path(output_dir)
+    for _ in range(10):
+        candidate = directory / f"{secrets.token_hex(RANDOM_NAME_BYTES)}{extension}"
+        if not candidate.exists():
+            return candidate
+    # 64 位空间连撞 10 次基本不可能；真到了这里就加时间戳兜底，而不是抛错
+    return directory / (f"{secrets.token_hex(RANDOM_NAME_BYTES)}"
+                        f"-{int(time.time())}{extension}")
+
+
+def _explicit_path(base: Path, index: int, mime: str) -> Path:
+    """调用方显式给了路径时的命名：第 0 张用它，多张时加序号后缀。"""
     extension = _EXTENSION_BY_MIME.get(mime or "", "")
     if not extension:
-        extension = Path(base).suffix or ".bin"
+        extension = base.suffix or ".bin"
     if index == 0:
         return base if base.suffix else base.with_suffix(extension)
     return base.with_name(f"{base.stem}_{index + 1}{extension}")
@@ -217,7 +242,12 @@ def generate_image(
     conversation_id: str | None = None,
     note: Callable[[str], None] | None = None,
 ) -> GenerationResult:
-    """跑完一次生图。"""
+    """跑完一次生图。
+
+    ``out`` 省略时（默认）落到 ``Settings.output_dir``（默认 ``output/``）下，
+    文件名随机、后缀由图片 MIME 决定。显式传 ``out`` 只是给库调用方留的覆盖口，
+    CLI 与 GUI 都不暴露。
+    """
     settings = client.settings
     timeout = settings.generation_timeout if timeout is None else timeout
     poll_interval = settings.poll_interval if poll_interval is None else poll_interval
@@ -267,7 +297,10 @@ def generate_image(
         title = title or collected.title
 
     # ⑥ 逐张下载落盘
-    base = Path(out) if out else Path(f"{cid or 'generated'}.png")
+    # 默认不询问路径：一律落到 output/ 下，文件名随机、后缀跟 MIME 走。
+    # ``out`` 只作为**库调用方**的显式覆盖保留，CLI 与 GUI 都不暴露它。
+    output_dir = Path(settings.output_dir)
+    explicit = Path(out) if out is not None else None
     results: list[ImageResult] = []
     notes: list[str] = []
     for index, asset in enumerate(assets):
@@ -277,7 +310,8 @@ def generate_image(
         asset_notes, mime, width, height = _verify(data, asset)
         notes.extend(f"{asset.asset_pointer}: {n}" for n in asset_notes)
 
-        path = _target_path(base, index, mime, asset)
+        path = (_explicit_path(explicit, index, mime) if explicit is not None
+                else random_output_path(output_dir, mime))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         say(f"已落盘 {path}（{width}×{height}，{len(data)} 字节，{mime}）")

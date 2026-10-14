@@ -65,7 +65,7 @@ def main() -> int:
         print(f"[FAIL] 无法创建窗口：{exc!r}")
         print("       若是无桌面环境（纯 SSH / 容器），请改用命令行：")
         print('         python -m cgpt login')
-        print('         python -m cgpt generate "生成一张地球图片" --out output/earth.png')
+        print('         python -m cgpt generate "生成一张地球图片"')
         return 1
 
     try:
@@ -81,8 +81,10 @@ def main() -> int:
         check("账号默认掩码", app.account_entry.cget("show") == "•")
         check("提示词已预填", bool(app.prompt_text.get("1.0", "end").strip()),
               app.prompt_text.get("1.0", "end").strip())
-        check("输出路径已预填", bool(app.output_var.get()),
-              app.output_var.get())
+        check("输出目录提示可见",
+              "output" in str(app.generate_button.master.winfo_children()[0].cget("text")),
+              str(app.generate_button.master.winfo_children()[0].cget("text")))
+        check("有「打开输出目录」按钮", app.open_dir_button.winfo_exists() == 1)
         check("会话状态可见", bool(app.session_var.get()),
               app.session_var.get())
         check("四个操作按钮就位",

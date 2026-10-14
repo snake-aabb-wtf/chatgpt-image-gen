@@ -52,6 +52,9 @@ class Settings(BaseModel):
     credentials_path: Path = DEFAULT_CREDENTIALS_PATH
     profile_dir: Path = DEFAULT_PROFILE_DIR
 
+    #: 生成图片的落盘目录。文件名由工具随机生成，不询问用户
+    output_dir: Path = Path("output")
+
     # --- 客户端标识头 ---
     originator: str = "chatgpt.com"
     oai_language: str = "zh-CN"
