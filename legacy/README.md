@@ -45,9 +45,20 @@ python tools/build_har_vectors.py     # 从 legacy/har/ 重新提取真值
 
 ## 关于体积
 
-这 230 MB 不适合进版本库。当前仓库还没有初始化 git；如果以后要 `git init`，
-建议先把它们排除：
+这 216 MB 抓包**已经入库**（提交 `debf80b`）。它们是文本 JSON，git 压缩效果很好：
+`.git/` 只有约 54 MB，而不是 216 MB。
 
-```gitignore
-legacy/har/
-```
+两点相关的仓库设置：
+
+* `.gitattributes` 把 `*.har` 标为 `binary`。这是**必须**的 —— 本机
+  `core.autocrlf=true`，若不标记，git 会把这些 JSON 当文本并在签出时转换行尾，
+  改变文件字节。而 `docs/01` §4.5 与 `docs/02` §4.5 的结论正是建立在
+  **逐字节相等**之上的，字节一变那些结论就不可复现了。
+* 提交后已校验：7 份抓包的文件大小与移动前完全一致，且用它们重新提取真值，
+  `pow`/`xor`/`kinds`/`identical` 四类向量与提交内 `cgpt/data/har_vectors.json`
+  逐字段相同 —— 说明内容一个字节都没被改动。
+
+> 若以后要推到远端（GitHub 等）：这些抓包里含抓包**当时有效**的会话 Cookie 与
+> `Authorization: Bearer`（`cf_clearance` 亦在其中）。它们会过期，但推送前值得
+> 再确认一次这是你想要的。2FA 种子**不在**抓包里（服务端只收到 6 位验证码），
+> 源码与文档中也已替换为占位值。
