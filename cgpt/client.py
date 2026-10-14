@@ -70,7 +70,12 @@ class Client:
         client = cls(credentials=Credentials(), settings=settings,
                      browser=session, log=log)
         client._owns_browser = True
-        client.credentials = session.login(email, password, totp_secret)
+        try:
+            client.credentials = session.login(email, password, totp_secret)
+        finally:
+            # 登录完成后凭据（含刚签发的哨兵令牌）已经在手，浏览器没用了。
+            # 放在 finally 里是为了失败时也不留一个孤儿窗口。
+            client._release_browser()
         return client
 
     @classmethod
@@ -93,18 +98,31 @@ class Client:
     # --- 浏览器（惰性） -----------------------------------------------
 
     def ensure_browser(self) -> BrowserSession:
-        """按需启动浏览器。用于刷新哨兵令牌与 Cloudflare 回退。"""
+        """按需启动浏览器。用于刷新哨兵令牌与 Cloudflare 回退。
+
+        ``start()`` 是幂等的（已启动则直接返回），所以这里**无条件调用** ——
+        不能假设"``self._browser`` 非空就等于已经在跑"，那是个隐式不变量，
+        一旦哪天有人在别处关掉会话却没置 None，就会变成难查的哑失败。
+        """
         if self._browser is None:
             self.log("启动浏览器（用于刷新准入令牌 / Cloudflare 回退）…")
             self._browser = BrowserSession(self.settings, log=self.log)
-            self._browser.start()
             self._owns_browser = True
+        self._browser.start()
         return self._browser
 
     def refresh_sentinel(self) -> SentinelTokens:
-        """回浏览器重新抓一轮三条哨兵令牌，并更新凭据。"""
+        """回浏览器重新抓一轮三条哨兵令牌，并更新凭据。
+
+        **用完就把浏览器关掉**：它是可见的重型窗口，令牌到手后就没有存在价值了。
+        关掉不会削弱 Cloudflare 回退 —— 回退走 ``_browser_fetch``，会按需重开。
+        """
         session = self.ensure_browser()
-        credentials = session.refresh_credentials()
+        try:
+            credentials = session.refresh_credentials()
+        finally:
+            self._release_browser()
+
         self.credentials.sentinel = credentials.sentinel
         # Cookie 也可能在这轮被轮换，一并更新
         if credentials.cookies:
@@ -119,6 +137,18 @@ class Client:
             self.log("警告：这一轮仍未抓到哨兵令牌，对话请求可能被拒")
         return self.credentials.sentinel or SentinelTokens(
             chat_requirements="", proof="", turnstile="", issued_at=0.0)
+
+    def _release_browser(self) -> None:
+        """关闭浏览器窗口（幂等）。
+
+        刻意**不**在这里顺手清掉 ``self._transport``：回退用的是惰性取数函数，
+        浏览器关了它照样能在需要时重开，不需要重建传输层。
+        """
+        if self._browser is None:
+            return
+        self._browser.close()
+        self._browser = None
+        self.log("已关闭浏览器窗口（需要时会自动重新打开）")
 
     def _sentinel_is_fresh(self) -> bool:
         tokens = self.credentials.sentinel
@@ -135,12 +165,21 @@ class Client:
 
     # --- 传输层 -------------------------------------------------------
 
+    def _browser_fetch(self, **kwargs):
+        """给 Cloudflare 回退用的取数函数：**按需**启动浏览器。
+
+        这里必须是惰性的，不能直接绑 ``self._browser.fetch_in_context``：
+        浏览器一关，那种绑法就永久失效了 —— 而且**不会报错**，直到真的被
+        Cloudflare 拦住才发现回退早就没了。
+        """
+        session = self.ensure_browser()
+        return session.fetch_in_context(**kwargs)
+
     def _build_transport(self) -> Transport:
         primary = HttpTransport(impersonate=self.settings.impersonate,
                                 proxy=self.settings.proxy)
-        if self._browser is None:
-            return primary
-        fallback = BrowserTransport(self._browser.fetch_in_context)
+        # 始终挂上回退：它自己会在被拦时按需启动浏览器
+        fallback = BrowserTransport(self._browser_fetch)
         return FallbackTransport(
             primary, fallback,
             on_fallback=lambda url: self.log(

@@ -14,7 +14,7 @@ Playwright 只负责过 Cloudflare + 登录 + 取令牌，业务请求走 curl_c
 ## 1. 命令（已验证，可直接抄）
 
 ```bash
-# 测试（182 个用例；pytest 会自己定位 rootdir，任意目录可跑）
+# 测试（194 个用例；pytest 会自己定位 rootdir，任意目录可跑）
 python -m pytest tests/ -q
 python -m pytest tests/test_api.py -q            # 单文件
 python -m pytest tests/test_api.py -k sse -q     # 单主题
@@ -50,7 +50,7 @@ python -m cgpt gui        # 会弹窗，需要人工交互
 python -m pytest tests/ -q > /dev/null 2>&1; echo $?   # 0 = 通过
 ```
 
-> 本环境下 pytest 的摘要行（`182 passed in …`）有时不会到达调用方的管道，
+> 本环境下 pytest 的摘要行（`194 passed in …`）有时不会到达调用方的管道，
 > 只看输出会误判成失败。**退出码是唯一可靠信号。**
 
 ---
@@ -119,6 +119,25 @@ https://auth.openai.com/log-in/password  -> 403 cf-mitigated: challenge
 * Playwright 同步 API **必须在创建它的线程里使用**。GUI 因此让工作线程独占 `Client`，主线程只碰 Tk，两者用 `queue` + `after(100ms)` 通信。
 * 生图**没有独立接口**，是否出图由服务端依据 `image_gen_tool_enabled` + 意图决定。
   **没出图是合法分支**，抛 `NoImageProducedError`，不要伪造成功、不要改成"返回占位图"。
+
+### 3.6 浏览器：按需开、用完关，且回退必须惰性取数
+
+`Client` 里有一条容易在"优化"时被破坏的不变量：
+
+```
+ensure_browser()   按需启动（start() 幂等，无条件调用）
+_release_browser() 用完就关，幂等；login / refresh_sentinel 都在 finally 里调
+_browser_fetch()   给 Cloudflare 回退用的**惰性**取数函数
+```
+
+* `_build_transport()` **必须始终挂上 `FallbackTransport`**，且回退走 `_browser_fetch`
+  而不是直接绑 `self._browser.fetch_in_context`。
+  曾经的写法是「浏览器为 None 就直接 return primary」——那样一旦"用完就关"，
+  **回退会永久消失且不报任何错**，直到真被 Cloudflare 拦住才发现。
+  回归测试见 `tests/test_client_lifecycle.py`。
+* 反过来也不要"顺手"去掉 `_release_browser`：用户会看到刷新完令牌后浏览器窗口一直挂着。
+* 例外：如果某次请求**真的**被 CF 拦过，浏览器会保持打开（回退刚用过它，随后续请求大概率还要用）。
+  它会在下一轮刷新或 `Client.close()` 时关闭。
 
 ---
 

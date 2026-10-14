@@ -509,10 +509,8 @@ class GuiApp:
                               settings=self.settings, log=self._log)
         ctx.client = client
         self._log(f"凭据已保存到 {client.save()}")
-        # 登录后哨兵令牌刚签发（TTL 540 秒），生图用不上浏览器了 —— 关掉窗口，
-        # 令牌过期时 Client 会自动重新打开（profile 里已有会话，很快）。
-        client.close()
-        self._log("已关闭浏览器窗口（令牌过期时会自动重新打开）")
+        # 浏览器窗口由 Client 在登录完成后自行关闭（见 Client._release_browser），
+        # 这里不再重复关一次，免得日志里出现两遍"已关闭浏览器窗口"。
         self._emit("session", self._probe_session(ctx.client))
 
     def _task_check_session(self, ctx: _Context) -> None:
