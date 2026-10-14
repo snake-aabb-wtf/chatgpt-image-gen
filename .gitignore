@@ -1,0 +1,22 @@
+# 凭据与浏览器 profile —— 含 90 天会话 Cookie 与 10 天 Bearer，绝不入库
+.cgpt/
+
+# 生成的图片
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

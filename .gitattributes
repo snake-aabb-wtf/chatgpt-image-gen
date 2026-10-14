@@ -1,0 +1,13 @@
+# HAR 抓包是约 226 MB 的 JSON **文本**。本机 core.autocrlf=true 时，git 会把
+# 它们当文本处理并在签出时做行尾转换 —— 那会改变文件字节，破坏分析文档里
+# "逐字节比对"结论的可复现性（docs/01 §4.5、docs/02 §4.5 都依赖逐字节相等）。
+# 因此明确标为二进制，禁止任何转换、diff 与 merge。
+*.har binary
+
+# 图片同理：不要让 git 碰
+*.png binary
+*.jpg binary
+*.webp binary
+
+# 抓包里的 JSON 真值文件与载荷字面量很大，diff 出来没有意义
+cgpt/data/har_vectors.json -diff

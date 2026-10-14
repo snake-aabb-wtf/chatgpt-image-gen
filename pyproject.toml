@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cgpt-imagen"
+version = "0.1.0"
+description = "用 ChatGPT 账密 + 2FA 登录并请求生图（Playwright 过 Cloudflare + curl_cffi 走 HTTP）"
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.40",
+    "curl_cffi>=0.7",
+    "pydantic>=2.6",
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+yaml = ["PyYAML>=6.0"]
+
+[project.scripts]
+cgpt = "cgpt.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cgpt*"]
+
+[tool.setuptools.package-data]
+"cgpt.data" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+markers = [
+    "live: 需要真实网络与真实账号（默认不跑，用 -m live 显式启用）",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 自证测试需要在断言里写很长的中文说明与真实令牌字面量
+"tests/*" = ["E402"]

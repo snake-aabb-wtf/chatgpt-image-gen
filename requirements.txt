@@ -1,0 +1,9 @@
+# 运行时依赖（当前环境均已预装）
+playwright>=1.40
+curl_cffi>=0.7
+pydantic>=2.6
+click>=8.1
+rich>=13.0
+
+# 可选：YAML 配置文件支持
+PyYAML>=6.0

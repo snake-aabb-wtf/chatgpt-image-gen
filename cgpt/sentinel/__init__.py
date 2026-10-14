@@ -1,0 +1,87 @@
+"""Sentinel 校验材料：指纹载荷、工作量证明、XOR 混淆、Fernet 令牌。
+
+本子包内全部为**纯函数**，不做任何 IO，也不依赖网络库 ——
+因此可以直接用 `legacy/har/` 里的真实抓包做离线自证。
+"""
+
+from cgpt.sentinel.fernet import FernetInfo, parse_fernet, parse_fernet_bytes
+from cgpt.sentinel.payload import (
+    KIND_BINARY,
+    KIND_FERNET,
+    KIND_SENTINEL_PAYLOAD,
+    KIND_UNKNOWN,
+    PREFIX_ANSWER,
+    PREFIX_REQUIREMENTS,
+    SOLVED_SUFFIX,
+    PayloadInfo,
+    answer_counter,
+    b64_to_bytes,
+    build_fingerprint,
+    decode_payload,
+    encode_answer,
+    json_to_b64,
+)
+from cgpt.sentinel.pow import (
+    MAX_ATTEMPTS,
+    PowExhaustedError,
+    digest_for,
+    fnv1a_mix,
+    meets_difficulty,
+    solve,
+    verify,
+)
+from cgpt.sentinel.xor import (
+    KNOWN_KEYS,
+    CrackResult,
+    b64_to_latin1,
+    codec_roundtrip_matches,
+    crack,
+    crack_known_prefix,
+    crack_single_byte,
+    crack_with_candidates,
+    decode,
+    encode,
+    looks_like_blob,
+    probe_key_shape_ok,
+    xor_latin1,
+)
+
+__all__ = [
+    "KNOWN_KEYS",
+    "KIND_BINARY",
+    "KIND_FERNET",
+    "KIND_SENTINEL_PAYLOAD",
+    "KIND_UNKNOWN",
+    "MAX_ATTEMPTS",
+    "PREFIX_ANSWER",
+    "PREFIX_REQUIREMENTS",
+    "SOLVED_SUFFIX",
+    "CrackResult",
+    "FernetInfo",
+    "PayloadInfo",
+    "PowExhaustedError",
+    "answer_counter",
+    "b64_to_bytes",
+    "b64_to_latin1",
+    "build_fingerprint",
+    "codec_roundtrip_matches",
+    "crack",
+    "crack_known_prefix",
+    "crack_single_byte",
+    "crack_with_candidates",
+    "decode",
+    "decode_payload",
+    "digest_for",
+    "encode",
+    "encode_answer",
+    "fnv1a_mix",
+    "json_to_b64",
+    "looks_like_blob",
+    "meets_difficulty",
+    "parse_fernet",
+    "parse_fernet_bytes",
+    "probe_key_shape_ok",
+    "solve",
+    "verify",
+    "xor_latin1",
+]
