@@ -32,6 +32,26 @@ DEFAULT_CONNECT_TIMEOUT = 15.0
 DEFAULT_READ_TIMEOUT = 120.0
 DEFAULT_IMPERSONATE = "chrome"
 
+#: 挑战求解回调：收到被拦的 URL，返回 True 表示"用户已完成验证，可以重试"。
+#: 由 ``Client`` 提供 —— 它负责把验证页渲染出来、等用户、再重读 Cookie。
+ChallengeSolver = Callable[[str], bool]
+
+
+def challenge_message(url: str, *, solved: bool) -> str:
+    """两条通道都被拦时的错误文案。
+
+    措辞刻意写成"下一步该做什么"，而不是把 403 丢出去让上层去猜。
+    """
+    if solved:
+        return (
+            f"完成人机验证后重试，{url} 仍被 Cloudflare 拦截。\n"
+            f"浏览器窗口保持打开，可以看看里面的页面是否已经正常加载；\n"
+            f"若仍显示验证页，请再完成一次，然后重新执行刚才的操作。")
+    return (
+        f"{url} 被 Cloudflare 人机验证拦住，且用浏览器上下文重发也没过去。\n"
+        f"这通常意味着 Cloudflare 要求**人工**完成一次验证（不是指纹问题）。\n"
+        f"浏览器窗口已打开在该地址上，请在里面完成验证后重试。")
+
 
 @dataclass
 class TransportResponse:
@@ -203,52 +223,103 @@ class BrowserTransport:
 
 
 class FallbackTransport:
-    """先走 HTTP，遇到 Cloudflare 挑战就切浏览器上下文重发。"""
+    """先走 HTTP，被 Cloudflare 拦就切浏览器上下文重发。
 
-    def __init__(self, primary: Transport, fallback: Transport,
-                 on_fallback: Callable[[str], None] | None = None) -> None:
+    如果**两条路都被拦**，说明这不是"指纹不像浏览器"的问题，而是 Cloudflare
+    真的要求人机验证。此时交给 ``challenge_solver`` 去处理（把验证页渲染出来、
+    等用户点完），成功后再重试一次。
+
+    注意：不设 solver 时**必须抛错**，不能把 403 原样交给业务层 ——
+    那样业务层会去 ``json()`` 解析挑战页的 HTML，报出"返回的不是 JSON（403）"
+    这种完全看不出该干什么的错误。
+    """
+
+    def __init__(self, primary: Transport, fallback: Transport, *,
+                 on_fallback: Callable[[str], None] | None = None,
+                 challenge_solver: ChallengeSolver | None = None) -> None:
         self.primary = primary
         self.fallback = fallback
         self.on_fallback = on_fallback
+        self.challenge_solver = challenge_solver
         self.fallback_count = 0
+        self.solve_count = 0
 
     def _note(self, url: str) -> None:
         self.fallback_count += 1
         if self.on_fallback:
             self.on_fallback(url)
 
+    def _attempt(self, method: str, url: str, **kwargs: Any) -> TransportResponse:
+        """走一遍「主通道 → 被拦则回退」，返回最后一次的响应（可能仍是挑战）。"""
+        try:
+            response = self.primary.request(method, url, **kwargs)
+        except CloudflareChallengeError:
+            self._note(url)
+            return self.fallback.request(method, url, **kwargs)
+        if response.looks_like_cloudflare_challenge():
+            self._note(url)
+            return self.fallback.request(method, url, **kwargs)
+        return response
+
+    def _solve(self, url: str) -> bool:
+        if self.challenge_solver is None:
+            return False
+        self.solve_count += 1
+        return bool(self.challenge_solver(url))
+
     def request(self, method: str, url: str, *, headers: dict[str, str] | None = None,
                 json: Any = None, data: bytes | str | None = None,
                 timeout: float | None = None) -> TransportResponse:
-        try:
-            response = self.primary.request(method, url, headers=headers, json=json,
-                                            data=data, timeout=timeout)
-        except CloudflareChallengeError:
-            self._note(url)
-            return self.fallback.request(method, url, headers=headers, json=json,
-                                         data=data, timeout=timeout)
+        kwargs: dict[str, Any] = {"headers": headers, "json": json, "data": data,
+                                  "timeout": timeout}
+        response = self._attempt(method, url, **kwargs)
+        if not response.looks_like_cloudflare_challenge():
+            return response
+
+        if not self._solve(url):
+            raise CloudflareChallengeError(challenge_message(url, solved=False))
+
+        response = self._attempt(method, url, **kwargs)
         if response.looks_like_cloudflare_challenge():
-            self._note(url)
-            return self.fallback.request(method, url, headers=headers, json=json,
-                                         data=data, timeout=timeout)
+            raise CloudflareChallengeError(challenge_message(url, solved=True))
         return response
+
+    def _stream_once(self, method: str, url: str, *,
+                     headers: dict[str, str] | None = None,
+                     json: Any = None,
+                     timeout: float | None = None) -> Iterator[str]:
+        produced = False
+        try:
+            for line in self.primary.stream_lines(method, url, headers=headers,
+                                                  json=json, timeout=timeout):
+                produced = True
+                yield line
+            return
+        except CloudflareChallengeError:
+            if produced:
+                raise
+            self._note(url)
+        yield from self.fallback.stream_lines(method, url, headers=headers,
+                                              json=json, timeout=timeout)
 
     def stream_lines(self, method: str, url: str, *,
                      headers: dict[str, str] | None = None,
                      json: Any = None,
                      timeout: float | None = None) -> Iterator[str]:
-        yielded = False
-        try:
-            for line in self.primary.stream_lines(method, url, headers=headers,
-                                                  json=json, timeout=timeout):
-                yielded = True
-                yield line
-            return
-        except CloudflareChallengeError:
-            if yielded:
-                # 流已经开始产出再失败，**绝不能**回退重发：那会重复发送同一条
-                # 消息、重复消耗一次生图额度。这里如实抛出。
-                raise
-            self._note(url)
-        yield from self.fallback.stream_lines(method, url, headers=headers,
-                                              json=json, timeout=timeout)
+        for attempt in range(2):
+            yielded = False
+            try:
+                for line in self._stream_once(method, url, headers=headers,
+                                              json=json, timeout=timeout):
+                    yielded = True
+                    yield line
+                return
+            except CloudflareChallengeError:
+                if yielded:
+                    # 流已开始产出：**绝不能**重发。那会重复发送同一条消息、
+                    # 重复消耗一次生图额度 —— 宁可失败也不能偷偷多花一次。
+                    raise
+                if attempt == 1 or not self._solve(url):
+                    raise CloudflareChallengeError(
+                        challenge_message(url, solved=attempt == 1)) from None
+                # 用户过完验证 → 循环再试一次

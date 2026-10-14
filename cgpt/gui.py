@@ -285,6 +285,39 @@ class GuiApp:
                   ).grid(row=row, column=0, sticky="ew", pady=(8, 0))
 
     # ------------------------------------------------------------------
+    # 人机验证：工作线程发起，主线程弹框
+    # ------------------------------------------------------------------
+
+    #: 等工作线程那边拿到答复的上限；超过就当作放弃，避免永久卡住
+    CHALLENGE_WAIT_SECONDS = 600.0
+
+    def _challenge_prompt(self, url: str) -> bool:
+        """在工作线程里被调用：把"问用户"转交给主线程，然后阻塞等答复。
+
+        为什么不能直接弹框：Tkinter 不是线程安全的，工作线程碰控件会出问题；
+        而 Playwright 又必须留在工作线程。所以走 ``_emit`` + ``queue`` 这一趟。
+        """
+        answer: queue.Queue = queue.Queue(maxsize=1)
+        self._emit("challenge", (url, answer))
+        try:
+            return bool(answer.get(timeout=self.CHALLENGE_WAIT_SECONDS))
+        except queue.Empty:
+            self._emit("log", "等待人工验证超时，已放弃")
+            return False
+
+    def _ask_challenge(self, url: str, answer: queue.Queue) -> None:
+        """在主线程里弹框询问（由事件泵调用）。"""
+        ok = messagebox.askokcancel(
+            "需要完成人机验证",
+            "被 Cloudflare 人机验证拦住，自动用浏览器重发也没过去。\n\n"
+            f"浏览器窗口已打开在：\n{url}\n\n"
+            "请在那个窗口里完成验证（一般点一下复选框就行），\n"
+            "完成后点「确定」—— 我会重读 Cookie 并自动重试。\n\n"
+            "点「取消」则放弃本次操作。",
+            parent=self.root)
+        answer.put(ok)
+
+    # ------------------------------------------------------------------
     # 工作线程
     # ------------------------------------------------------------------
 
@@ -364,6 +397,9 @@ class GuiApp:
             self.session_var.set(payload.render())
         elif kind == "result":
             self._show_result(payload)
+        elif kind == "challenge":
+            url, answer = payload
+            self._ask_challenge(url, answer)
         elif kind == "done":
             self._set_busy(False)
             self._append_log(f"—— {payload} 结束 ——")
@@ -506,7 +542,9 @@ class GuiApp:
 
         client = Client.login(email=secret.email, password=secret.password,
                               totp_secret=secret.totp_secret,
-                              settings=self.settings, log=self._log)
+                              settings=self.settings,
+                              challenge_prompt=self._challenge_prompt,
+                              log=self._log)
         ctx.client = client
         self._log(f"凭据已保存到 {client.save()}")
         # 浏览器窗口由 Client 在登录完成后自行关闭（见 Client._release_browser），
@@ -517,16 +555,18 @@ class GuiApp:
         from cgpt.client import Client
 
         if ctx.client is None:
-            ctx.client = Client.from_credentials(settings=self.settings,
-                                                 log=self._log)
+            ctx.client = Client.from_credentials(
+                settings=self.settings, challenge_prompt=self._challenge_prompt,
+                log=self._log)
         self._emit("session", self._probe_session(ctx.client))
 
     def _task_generate(self, ctx: _Context, prompt: str, output: str) -> None:
         from cgpt.client import Client
 
         if ctx.client is None:
-            ctx.client = Client.from_credentials(settings=self.settings,
-                                                 log=self._log)
+            ctx.client = Client.from_credentials(
+                settings=self.settings, challenge_prompt=self._challenge_prompt,
+                log=self._log)
         result = ctx.client.generate_image(prompt, out=output)
         ctx.client.save()        # 把刷新后的哨兵令牌一并存下
         self._emit("result", result)

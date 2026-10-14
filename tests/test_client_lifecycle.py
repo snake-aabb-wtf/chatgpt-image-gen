@@ -76,11 +76,6 @@ def _stale_credentials() -> Credentials:
     )
 
 
-@pytest.fixture
-def logs() -> list[str]:
-    return []
-
-
 def _settings(tmp_path: Path) -> Settings:
     return Settings(credentials_path=tmp_path / "c.json",
                     profile_dir=tmp_path / "p",

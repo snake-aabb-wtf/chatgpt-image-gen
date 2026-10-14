@@ -40,6 +40,10 @@ from cgpt.models import Credentials, GenerationResult, SentinelTokens
 #: 哨兵令牌剩余寿命低于这个值就视为需要刷新（服务端 540 秒，留 60 秒余量）
 SENTINEL_REFRESH_MARGIN = 60.0
 
+#: 询问用户"人机验证完成了吗"的回调；返回 True 表示可以重试。
+#: 由调用方提供（CLI 用回车确认、GUI 用对话框）。为 None 时不等待，直接报错。
+ChallengePrompt = Callable[[str], bool]
+
 
 class Client:
     """ChatGPT 生图客户端。"""
@@ -48,9 +52,11 @@ class Client:
                  settings: Settings | None = None,
                  transport: Transport | None = None,
                  browser: BrowserSession | None = None,
+                 challenge_prompt: ChallengePrompt | None = None,
                  log: Callable[[str], None] | None = None) -> None:
         self.credentials = credentials
         self.settings = settings or Settings()
+        self.challenge_prompt = challenge_prompt
         self.log = log or (lambda _message: None)
         self._browser = browser
         self._owns_browser = False
@@ -62,13 +68,15 @@ class Client:
     @classmethod
     def login(cls, *, email: str, password: str, totp_secret: str,
               settings: Settings | None = None, headless: bool | None = None,
+              challenge_prompt: ChallengePrompt | None = None,
               log: Callable[[str], None] | None = None) -> "Client":
         """用账密 + TOTP 登录并抓取凭据（会启动真实浏览器）。"""
         settings = settings or Settings()
         session = BrowserSession(settings, headless=headless, log=log)
         session.start()
         client = cls(credentials=Credentials(), settings=settings,
-                     browser=session, log=log)
+                     browser=session, challenge_prompt=challenge_prompt,
+                     log=log)
         client._owns_browser = True
         try:
             client.credentials = session.login(email, password, totp_secret)
@@ -81,13 +89,15 @@ class Client:
     @classmethod
     def from_credentials(cls, path: Path | str | None = None, *,
                          settings: Settings | None = None,
+                         challenge_prompt: ChallengePrompt | None = None,
                          log: Callable[[str], None] | None = None) -> "Client":
         """从磁盘读凭据（不启动浏览器；需要时才惰性启动）。"""
         settings = settings or Settings()
         if path is not None:
             settings = settings.model_copy(update={"credentials_path": Path(path)})
         credentials = load_credentials(settings.credentials_path)
-        return cls(credentials=credentials, settings=settings, log=log)
+        return cls(credentials=credentials, settings=settings,
+                   challenge_prompt=challenge_prompt, log=log)
 
     # --- 持久化 -------------------------------------------------------
 
@@ -183,7 +193,59 @@ class Client:
         return FallbackTransport(
             primary, fallback,
             on_fallback=lambda url: self.log(
-                f"被 Cloudflare 拦截，改用浏览器上下文重发：{url[:80]}"))
+                f"被 Cloudflare 拦截，改用浏览器上下文重发：{url[:80]}"),
+            challenge_solver=self._solve_challenge)
+
+    def _solve_challenge(self, url: str) -> bool:
+        """两条通道都被拦时：把验证页渲染出来 → 等用户 → 重读 Cookie。
+
+        返回 True 表示"用户说已经过了，可以重试"。任何一步出问题都返回 False，
+        让传输层抛出那条说人话的错误，而不是把 403 丢给业务层去猜。
+
+        整个方法都在**持有 Playwright 的那个线程**里执行（CLI 是主线程，
+        GUI 是工作线程）—— ``challenge_prompt`` 负责把"问用户"这件事安全地
+        转交给主线程。
+        """
+        if self.challenge_prompt is None:
+            return False
+        try:
+            session = self.ensure_browser()
+            session.open_for_challenge(url)
+        except Exception as exc:  # noqa: BLE001 - 打不开浏览器就如实失败
+            self.log(f"无法为人工验证打开浏览器：{exc!r}")
+            return False
+
+        if not self.challenge_prompt(url):
+            self.log("已放弃本次人机验证")
+            return False
+
+        self._reload_cookies_from_browser(session)
+        return True
+
+    def _reload_cookies_from_browser(self, session: BrowserSession) -> None:
+        """把浏览器里的 Cookie 重新读进来。
+
+        这一步不能省：用户在浏览器里过完验证后，``cf_clearance`` 是在**浏览器**
+        里被刷新的，我们手里的快照还是旧的 —— 不重读的话，重试会拿旧 Cookie
+        再撞一次墙。
+        """
+        try:
+            cookies = {cookie["name"]: cookie["value"]
+                       for cookie in session.read_cookies()}
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"重读 Cookie 失败：{exc!r}")
+            return
+        if not cookies:
+            self.log("浏览器里没读到 Cookie，重试可能仍被拦")
+            return
+        self.credentials.cookies = cookies
+        self.credentials.captured_at = time.time()
+        device_id = cookies.get("oai-did")
+        if device_id:
+            self.credentials.device_id = device_id
+        self._web = None                     # 让客户端用新 Cookie 重建
+        self.log(f"已从浏览器重读 {len(cookies)} 个 Cookie"
+                 f"（含刷新后的 cf_clearance）")
 
     @property
     def web(self) -> ChatGptWebClient:

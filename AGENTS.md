@@ -139,6 +139,37 @@ _browser_fetch()   给 Cloudflare 回退用的**惰性**取数函数
 * 例外：如果某次请求**真的**被 CF 拦过，浏览器会保持打开（回退刚用过它，随后续请求大概率还要用）。
   它会在下一轮刷新或 `Client.close()` 时关闭。
 
+### 3.7 两条路都被拦 = 人工验证，必须交给用户
+
+`FallbackTransport` 的契约（`tests/test_challenge.py` 钉住）：
+
+```
+primary 被拦 → fallback 重发 → 还被拦
+    → challenge_solver(url)          交给用户去浏览器里过验证
+        返回 True  → 重试一次
+        返回 False → 抛 CloudflareChallengeError（说人话的那种）
+```
+
+三条不能破的规矩：
+
+1. **回退之后必须再检查一次**。曾经的写法是回退完直接 `return response`，
+   于是 403 漏到业务层，业务层去 `json()` 解析挑战页 HTML，报出
+   "返回的不是 JSON（403）"—— 用户完全看不出该干什么。旧测试还把这个行为
+   当成正确契约钉着（`test_fallback_transport_switches_when_browser_returns_challenge`），
+   已改名为 `..._raises_when_browser_context_also_blocked`。
+2. **让验证真正渲染出来只能靠导航**，不能在页面里 `fetch` —— 后者拿回的是挑战的
+   响应体，页面上不会出现可点的 Turnstile 控件。见 `BrowserSession.open_for_challenge`。
+3. **用户过完必须重读 Cookie**（`Client._reload_cookies_from_browser`）：
+   `cf_clearance` 是在浏览器里刷新的，不重读就是拿旧 Cookie 再撞一次。
+
+另外两条边界：
+
+* **流已产出数据就绝不重发**（内层 `_stream_once` 与外层 `stream_lines` 各有一道
+  闸）。宁可失败也不能重复发消息、重复消耗一次生图额度。
+* 库的默认行为是 `challenge_prompt=None` → **不等待、直接抛错**。只有 CLI 与 GUI
+  传入了交互实现。GUI 那边走 `_emit("challenge", (url, queue))` + 主线程弹框，
+  因为 Tk 不是线程安全的而 Playwright 必须留在工作线程。
+
 ---
 
 ## 4. 架构地图（按任务找文件）

@@ -276,3 +276,61 @@ def test_show_result_with_no_images_does_not_crash(app) -> None:
 
     app._show_result(GenerationResult(conversation_id="cid", images=[]))
     assert "没有产出图片" in app.log_text.get("1.0", "end")
+
+
+# --- 人机验证的跨线程握手 -------------------------------------------------
+
+
+def _pump_until(app, worker, timeout: float = 5.0) -> None:
+    """主线程这边跑事件泵，直到工作线程结束。
+
+    真实场景就是这样：Playwright 在工作线程里，弹框必须在主线程，
+    两边靠 queue 传一个布尔值。
+    """
+    import queue as _queue
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while worker.is_alive() and _time.monotonic() < deadline:
+        try:
+            kind, payload = app._events.get(timeout=0.1)
+        except _queue.Empty:
+            continue
+        app._handle_event(kind, payload)
+    worker.join(timeout=timeout)
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_challenge_prompt_round_trip(app, monkeypatch, answer: bool) -> None:
+    import threading
+
+    monkeypatch.setattr(gui.messagebox, "askokcancel", lambda *a, **kw: answer)
+    result: list[bool] = []
+    worker = threading.Thread(target=lambda: result.append(
+        app._challenge_prompt("https://chatgpt.com/backend-api/me")))
+    worker.start()
+    _pump_until(app, worker)
+
+    assert result == [answer], "答复必须回到工作线程"
+
+
+def test_challenge_prompt_event_carries_a_reply_queue(app) -> None:
+    """事件里必须带一个可写回的队列，否则工作线程会一直等。"""
+    import threading
+
+    seen: list[tuple] = []
+
+    def fake_ask(url, answer_queue):
+        seen.append((url, answer_queue))
+        answer_queue.put(True)
+
+    original = app._ask_challenge
+    app._ask_challenge = fake_ask
+    try:
+        worker = threading.Thread(target=lambda: app._challenge_prompt("https://x"))
+        worker.start()
+        _pump_until(app, worker)
+    finally:
+        app._ask_challenge = original
+
+    assert seen and seen[0][0] == "https://x"

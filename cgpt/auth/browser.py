@@ -229,9 +229,10 @@ class BrowserSession:
 
     def _is_logged_in(self) -> bool:
         return any(cookie["name"].startswith(SESSION_COOKIE_PREFIX)
-                   for cookie in self._all_cookies())
+                   for cookie in self.read_cookies())
 
-    def _all_cookies(self) -> list[dict[str, Any]]:
+    def read_cookies(self) -> list[dict[str, Any]]:
+        """读出三个域上的全部 Cookie（用于收集凭据 / 刷新后重读）。"""
         cookies: list[dict[str, Any]] = []
         for url in ("https://chatgpt.com", "https://auth.openai.com",
                     "https://sentinel.openai.com"):
@@ -240,6 +241,25 @@ class BrowserSession:
             except Exception:  # noqa: BLE001
                 continue
         return cookies
+
+    def open_for_challenge(self, url: str) -> None:
+        """把浏览器**导航**到被拦的地址，让 Cloudflare 的验证页真正渲染出来。
+
+        为什么必须导航、不能沿用页面里的 ``fetch``：``fetch`` 拿回来的是挑战的
+        HTML **响应体**，页面上不会出现可点的 Turnstile 控件 —— 用户没有东西可点。
+        导航则会走正常的文档加载路径，Cloudflare 的验证页就会显示出来。
+
+        导航到业务 API 地址时，若 CF 不再要求验证，页面会直接显示 JSON ——
+        那也说明放行了，调用方随后重试即可。
+        """
+        absolute = url if url.startswith("http") else HOME_URL.rstrip("/") + url
+        self.log(f"把浏览器导航到被拦地址，以便渲染人机验证：{absolute[:100]}")
+        # 只试一次：这一步失败就直接交给上层报错，不必再重试
+        self._goto(absolute, attempts=1)
+        try:
+            self.page.bring_to_front()
+        except Exception:  # noqa: BLE001 - 无头模式或已关闭时忽略
+            pass
 
     # --- 页面就绪与重试 -------------------------------------------------
 
@@ -614,7 +634,7 @@ class BrowserSession:
 
     def _collect(self) -> Credentials:
         cookies = {cookie["name"]: cookie["value"]
-                   for cookie in self._all_cookies()}
+                   for cookie in self.read_cookies()}
         if not any(name.startswith(SESSION_COOKIE_PREFIX) for name in cookies):
             raise LoginBlockedError("收集凭据时发现会话 Cookie 不见了。")
 

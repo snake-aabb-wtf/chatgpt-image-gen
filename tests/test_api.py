@@ -634,13 +634,22 @@ def test_fallback_transport_switches_on_challenge() -> None:
     assert transport.fallback_count == 1
 
 
-def test_fallback_transport_switches_when_browser_returns_challenge() -> None:
-    """回退路径自己也被拦时，原样把结果交回给调用方判断。"""
+def test_fallback_transport_raises_when_browser_context_also_blocked() -> None:
+    """回退路径自己也被拦 → 抛可操作的错误，**不能**把 403 漏给业务层。
+
+    早先这里断言的是"原样把结果交回给调用方判断"——那正是 bug 的来源：
+    业务层拿到 403 后去 ``json()`` 解析挑战页的 HTML，报出
+    "返回的不是 JSON（403）"，完全看不出该干什么。
+    现在改为抛 ``CloudflareChallengeError``，消息直接说清"去浏览器完成验证"。
+    """
     primary = _OnceTransport(error=CloudflareChallengeError("blocked"))
     fallback = _OnceTransport(response=_challenge_response())
     transport = FallbackTransport(primary, fallback)
-    response = transport.request("GET", "https://chatgpt.com/x")
-    assert response.looks_like_cloudflare_challenge() is True
+
+    with pytest.raises(CloudflareChallengeError) as excinfo:
+        transport.request("GET", "https://chatgpt.com/x")
+
+    assert "人机验证" in str(excinfo.value)
     assert transport.fallback_count == 1
 
 

@@ -60,6 +60,24 @@ def _settings(ctx: click.Context) -> Settings:
     )
 
 
+def _challenge_prompt(url: str) -> bool:
+    """命令行下的人机验证交互：把验证页开出来，等用户点完。
+
+    返回 True 表示"已经过验证了，可以重试"。
+    """
+    _echo("")
+    _echo("⚠ 被 Cloudflare 人机验证拦住，自动用浏览器重发也没过去。")
+    _echo(f"  浏览器窗口已打开在：{url}")
+    _echo("  请在浏览器里完成验证（一般点一下复选框就行），")
+    _echo("  然后回到这里按回车 —— 我会重读 Cookie 并自动重试。")
+    if not sys.stdin.isatty():
+        _echo("  当前不是交互终端，无法等待人工验证。")
+        return False
+    answer = click.prompt("  完成了吗（回车=是，输入 n=放弃）", default="",
+                          show_default=False)
+    return answer.strip().lower() not in ("n", "no", "否")
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--credentials", default=".cgpt/credentials.json", show_default=True,
               help="凭据文件路径")
@@ -141,7 +159,8 @@ def whoami(ctx: click.Context) -> None:
 
     settings = _settings(ctx)
     try:
-        with Client.from_credentials(settings=settings, log=_echo) as client:
+        with Client.from_credentials(settings=settings, log=_echo,
+                                     challenge_prompt=_challenge_prompt) as client:
             info = client.web.accounts_check()
             me = client.whoami()
     except CgptError as exc:
@@ -177,7 +196,8 @@ def generate(ctx: click.Context, prompt: str, out: str | None,
 
     settings = _settings(ctx)
     try:
-        with Client.from_credentials(settings=settings, log=_echo) as client:
+        with Client.from_credentials(settings=settings, log=_echo,
+                                     challenge_prompt=_challenge_prompt) as client:
             result = client.generate_image(
                 prompt, out=out, timeout=timeout,
                 refresh_sentinel=not no_refresh_sentinel)
