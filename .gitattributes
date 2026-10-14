@@ -8,3 +8,11 @@
 *.png binary
 *.jpg binary
 *.webp binary
+
+# Windows 脚本统一 CRLF，不依赖使用者的 core.autocrlf：
+# .cmd 在 LF-only 下解析有已知怪癖（标签与括号块）。
+# 注意 run-gui.ps1 是「UTF-8 带 BOM」，BOM 在行首不受行尾转换影响；
+# 若编辑器弄丢 BOM，PowerShell 5.1 会按系统 ANSI 读，中文会碎成假语法错误。
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
