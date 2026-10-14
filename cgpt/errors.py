@@ -70,6 +70,20 @@ class SentinelRejectedError(CgptError):
     """
 
 
+class PromptRejectedError(CgptError):
+    """助手只回了一段文字、没调用生图工具 —— 这一轮没有画图。
+
+    两种成因，**从返回内容上分不开**，所以文案里两个都要说：
+
+    * 提示词被内容策略拦下（违规驳回）；
+    * 提示词本身就没要求生成图片（比如问了句"1+1 等于几"）。
+
+    为什么单独一个类型：这**不是**故障，而是服务端明确地没打算画图。
+    早先的实现只找图片资产，找不到就当"图还在生成"，于是轮询到超时 ——
+    用户看到的就是"卡死"。现在立刻失败，并把模型的原话带出来。
+    """
+
+
 class UnsafeDownloadURLError(CgptError):
     """服务端下发的 download_url 指向非 chatgpt.com 域。
 

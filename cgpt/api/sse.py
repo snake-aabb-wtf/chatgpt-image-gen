@@ -127,6 +127,80 @@ def _dedupe(assets: Iterable[ImageAsset]) -> list[ImageAsset]:
     return unique
 
 
+#: ``content_type`` 里这几个值说明助手**调用过工具**（生图必然经过工具调用）
+_TOOL_CONTENT_TYPES = {"code", "tool", "function", "tool_call"}
+
+
+@dataclass
+class AnswerSignals:
+    """从事件流/会话详情里提取的"助手到底答了什么"。
+
+    存在的理由：提示词被内容策略驳回时，服务端会正常返回一段**文本**，
+    既没有图片资产、也没有任何工具调用痕迹。早先的实现只找图片资产，
+    找不到就以为"图还在生成"，于是死等到超时 —— 用户看到的就是"卡死"。
+    """
+
+    #: 助手说过的话（按出现顺序拼接）。驳回时这里就是模型的原文。
+    text: str = ""
+    #: 是否出现过工具调用痕迹（``role: "tool"`` 的消息，或 ``content_type: code``）。
+    #: 生图**必然**经过工具调用，所以它为 False 就说明这一轮压根没打算画图。
+    tool_evidence: bool = False
+    #: 消息是否已落终态（``status == "finished_successfully"`` 之类）
+    finished: bool = False
+
+    def merge(self, other: "AnswerSignals") -> None:
+        if other.text and other.text not in self.text:
+            self.text = (self.text + other.text) if self.text else other.text
+        self.tool_evidence = self.tool_evidence or other.tool_evidence
+        self.finished = self.finished or other.finished
+
+    def is_text_answer_without_image(self) -> bool:
+        """是不是"答了段文字、但没画图"——也就是被驳回的典型形态。"""
+        return not self.tool_evidence and bool(self.text.strip())
+
+
+def scan_answer_signals(node: Any, *, _depth: int = 0) -> AnswerSignals:
+    """递归扫描任意嵌套结构，提取助手文本与工具调用痕迹。
+
+    与 ``extract_assets`` 一样对结构不做强假设 —— 字段名变了也不会立刻瞎掉。
+    """
+    signals = AnswerSignals()
+    if _depth > MAX_SCAN_DEPTH:
+        return signals
+
+    if isinstance(node, dict):
+        author = node.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        content = node.get("content")
+        content_type = (content.get("content_type")
+                        if isinstance(content, dict) else None)
+
+        if role == "tool" or content_type in _TOOL_CONTENT_TYPES:
+            signals.tool_evidence = True
+
+        status = node.get("status")
+        if isinstance(status, str) and status.startswith("finished"):
+            signals.finished = True
+
+        # 只收**助手**说的话：用户自己的提示词不该被当成"模型的回复"
+        if role == "assistant" and isinstance(content, dict):
+            parts = content.get("parts")
+            if isinstance(parts, list):
+                chunks = [p for p in parts if isinstance(p, str) and p.strip()]
+                if chunks and content_type in (None, "text", "multimodal_text"):
+                    signals.text += "".join(chunks)
+
+        for key, value in node.items():
+            if key == "author":            # 别把 author 里的 role 重复扫一遍
+                continue
+            signals.merge(scan_answer_signals(value, _depth=_depth + 1))
+    elif isinstance(node, list):
+        for item in node:
+            signals.merge(scan_answer_signals(item, _depth=_depth + 1))
+
+    return signals
+
+
 @dataclass
 class StreamFindings:
     """一次 SSE 流里我们关心的一切。"""
@@ -139,6 +213,7 @@ class StreamFindings:
     last_assistant_message_id: str | None = None
     events_seen: int = 0
     server_errors: list[str] = field(default_factory=list)
+    answer: AnswerSignals = field(default_factory=AnswerSignals)
 
     def merge(self, other: "StreamFindings") -> None:
         if other.conversation_id:
@@ -151,6 +226,7 @@ class StreamFindings:
                                         or other.message_stream_complete)
         if other.last_assistant_message_id:
             self.last_assistant_message_id = other.last_assistant_message_id
+        self.answer.merge(other.answer)
 
 
 def _handle_delta(payload: dict[str, Any], findings: StreamFindings) -> None:
@@ -178,7 +254,14 @@ def _handle_delta(payload: dict[str, Any], findings: StreamFindings) -> None:
                 if isinstance(message_id, str) and message_id:
                     findings.last_assistant_message_id = message_id
 
+    # 流式文本是按路径逐段 append 的（``p: "/message/content/parts/0"``）
+    path = payload.get("p")
+    if (isinstance(path, str) and "/message/content/parts/" in path
+            and isinstance(value, str) and payload.get("o") in ("append", "add")):
+        findings.answer.text += value
+
     findings.assets = _dedupe([*findings.assets, *extract_assets(value)])
+    findings.answer.merge(scan_answer_signals(value))
 
 
 def consume_sse(lines: Iterable[str]) -> StreamFindings:
@@ -226,6 +309,7 @@ def consume_sse(lines: Iterable[str]) -> StreamFindings:
             _handle_delta(payload, findings)
         else:
             findings.assets = _dedupe([*findings.assets, *extract_assets(payload)])
+            findings.answer.merge(scan_answer_signals(payload))
 
     return findings
 
@@ -237,3 +321,8 @@ def extract_assets_from_conversation(payload: Any) -> list[ImageAsset]:
     这里不假设具体字段，直接递归找 —— 反正 ``extract_assets`` 有去重与深度上限。
     """
     return extract_assets(payload)
+
+
+def answer_signals_from_conversation(payload: Any) -> AnswerSignals:
+    """从会话详情里提取"助手答了什么"（用于轮询时提前发现驳回）。"""
+    return scan_answer_signals(payload)

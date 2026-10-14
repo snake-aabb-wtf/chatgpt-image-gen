@@ -15,10 +15,15 @@ from pathlib import Path
 from typing import Callable
 
 from cgpt.api.client import ChatGptWebClient, find_assets_in_conversation
+from cgpt.api.sse import (
+    AnswerSignals,
+    answer_signals_from_conversation,
+)
 from cgpt.errors import (
     CgptError,
     InvalidPromptError,
     NoImageProducedError,
+    PromptRejectedError,
     QuotaExhaustedError,
 )
 from cgpt.models import GenerationResult, ImageAsset, ImageResult
@@ -187,6 +192,24 @@ class ConversationAssets:
     title: str | None = None
 
 
+#: 没有任何"调用过生图工具"的痕迹时，最多再等这么久。
+#: 生图必然经过工具调用，所以没有痕迹基本就等于"这一轮不打算画图"；
+#: 留一小段宽限期是怕流里刚好缺了那个事件，但绝不为此等满整个超时。
+NO_TOOL_GRACE_SECONDS = 45.0
+
+
+def _rejection_message(signals: AnswerSignals) -> str:
+    said = signals.text.strip()
+    head = ("助手只回了一段文字，没有调用生图工具 —— 这一轮没有画图。\n"
+            "常见原因：提示词被内容策略拦下，或者提示词本身没有要求生成图片。\n"
+            "（这两种情况都不会消耗生图额度。）")
+    if not said:
+        return head + "\n\n（没有拿到助手的原文，可以去网页版看看这个会话。）"
+    if len(said) > 500:
+        said = said[:500] + "…"
+    return f"{head}\n\n助手的原话：\n{said}"
+
+
 def collect_assets(client: ChatGptWebClient, conversation_id: str | None,
                    *, timeout: float, poll_interval: float,
                    note: Callable[[str], None] | None = None) -> ConversationAssets:
@@ -195,6 +218,9 @@ def collect_assets(client: ChatGptWebClient, conversation_id: str | None,
     需要这条兜底路径的原因：抓包本身出现过 SSE 正文未落盘的情况
     （docs/03 §0 边界 2），说明"流里没有图"不等于"没出图"。
     标题也一并取回 —— 兜底路径下 SSE 里那个 `title_generation` 事件是缺失的。
+
+    但**不是**无脑等满超时：每次查询都会顺带看助手答了什么，
+    一旦发现"只有文字、没有工具调用"，立刻按驳回处理（见 ``PromptRejectedError``）。
     """
     if not conversation_id:
         raise CgptError(
@@ -204,6 +230,7 @@ def collect_assets(client: ChatGptWebClient, conversation_id: str | None,
     deadline = time.monotonic() + timeout
     attempt = 0
     last_title: str | None = None
+    started = time.monotonic()
     while time.monotonic() < deadline:
         attempt += 1
         try:
@@ -220,8 +247,15 @@ def collect_assets(client: ChatGptWebClient, conversation_id: str | None,
         if assets:
             return ConversationAssets(conversation_id=conversation_id,
                                       assets=assets, title=last_title)
+
+        signals = answer_signals_from_conversation(payload)
+        if signals.is_text_answer_without_image():
+            raise PromptRejectedError(_rejection_message(signals))
+
         if note:
-            note(f"第 {attempt} 次查询：暂无图片资产，{poll_interval:.0f}s 后重试")
+            note(f"第 {attempt} 次查询：暂无图片资产"
+                 f"（已等 {time.monotonic() - started:.0f}s），"
+                 f"{poll_interval:.0f}s 后重试")
         time.sleep(poll_interval)
 
     raise NoImageProducedError(
@@ -290,8 +324,23 @@ def generate_image(
     cid = findings.conversation_id
     title = findings.title
     if not assets:
-        say("事件流里没有图片资产，转向会话详情轮询…")
-        collected = collect_assets(client, cid, timeout=timeout,
+        # 先判断"这一轮到底打没打算画图"。生图必然经过工具调用，
+        # 没有工具痕迹又只有一段文字 = 被内容策略驳回了 —— 立刻失败，
+        # 别去等一个永远不会出现的图片资产（那就是用户看到的"卡死"）。
+        if findings.answer.is_text_answer_without_image():
+            raise PromptRejectedError(_rejection_message(findings.answer))
+
+        if findings.answer.tool_evidence:
+            poll_timeout = timeout
+            say("事件流里没有图片资产，但检测到生图工具调用，转向会话详情轮询…")
+        else:
+            # 既没图、又没工具痕迹、也没文本 —— 结构异常。给一小段宽限期，
+            # 但绝不为此等满整个超时。
+            poll_timeout = min(timeout, NO_TOOL_GRACE_SECONDS)
+            say(f"事件流里没有图片资产，也没检测到生图工具调用；"
+                f"只再等 {poll_timeout:.0f} 秒确认一下…")
+
+        collected = collect_assets(client, cid, timeout=poll_timeout,
                                    poll_interval=poll_interval, note=say)
         cid, assets = collected.conversation_id, collected.assets
         title = title or collected.title
