@@ -102,6 +102,25 @@ SW_MINIMIZE = 6
 #: 别让 PowerShell 弹一个控制台窗口出来
 CREATE_NO_WINDOW = 0x08000000
 
+#: 退出登录时**保留**的 Cookie：Cloudflare 放行凭证 + 设备标识。
+#: 清掉它们会平白再撞一次 Cloudflare，甚至被当成新设备而触发风控。
+#: （``__cf*`` / ``_cf*`` 系列由前缀覆盖，这里只列不满足前缀的两个。）
+_SIGN_OUT_KEEP = frozenset({"cf_clearance", "oai-did"})
+_SIGN_OUT_KEEP_PREFIXES = ("__cf", "_cf")
+
+
+def _is_kept_on_sign_out(name: str) -> bool:
+    return name in _SIGN_OUT_KEEP or name.startswith(_SIGN_OUT_KEEP_PREFIXES)
+
+
+def _mask_email(email: str) -> str:
+    """``someone@example.com`` → ``so***@example.com``，日志里不写全。"""
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "***"
+    head = local[:2] if len(local) > 2 else local[:1]
+    return f"{head}***@{domain}"
+
 
 def _win32_pids_using_profile(profile_dir: Path) -> set[int]:
     """命令行里带该 profile 目录的进程号。
@@ -151,12 +170,15 @@ class BrowserSession:
     def __init__(self, settings: Settings | None = None, *,
                  headless: bool | None = None,
                  minimized: bool | None = None,
+                 challenge_prompt: Callable[[str], bool] | None = None,
                  log: Callable[[str], None] | None = None) -> None:
         self.settings = settings or Settings()
         self.headless = self.settings.headless if headless is None else headless
         if minimized is None:
             minimized = self.settings.minimize_browser
         self.minimized = minimized
+        #: 遇到需要人工完成的 Cloudflare 验证时用它问用户；None 表示没人可问
+        self.challenge_prompt = challenge_prompt
         self.log = log or (lambda _message: None)
         self._playwright = None
         self._context = None
@@ -335,14 +357,30 @@ class BrowserSession:
     # --- 登录 ---------------------------------------------------------
 
     def login(self, email: str, password: str, totp_secret: str) -> Credentials:
-        """走完整登录流程，返回可直接用于 HTTP 的凭据。"""
+        """以给定账号登录，返回可直接用于 HTTP 的凭据。
+
+        ⚠️ **必须确认当前会话是不是这个账号**。持久化 profile 会记住上一个账号，
+        而早先的实现只要"检测到已登录"就跳过账密步骤 —— 于是用户填了新账号点
+        登录，实际还在用旧账号，**而且不报任何错**。
+        """
         self.log(f"打开登录页 {LOGIN_URL}")
         self._goto(LOGIN_URL)
         self._dismiss_cookie_banner()
 
         if self._is_logged_in():
-            self.log("持久化 profile 里已有有效会话，跳过账号密码步骤")
-            return self.refresh_credentials()
+            current = self._current_account_email()
+            if current and current.strip().lower() == email.strip().lower():
+                self.log(f"当前会话已经是 {_mask_email(current)}，跳过账号密码步骤")
+                return self.refresh_credentials()
+            if current:
+                self.log(f"当前会话属于 {_mask_email(current)}，"
+                         f"要登录的是 {_mask_email(email)} —— 先退出登录")
+            else:
+                # 问不出是哪个账号就**不能赌**：宁可多走一遍登录，也不能静默地
+                # 继续用旧账号。这正是这个 bug 的成因。
+                self.log("检测到已有会话，但问不出它属于哪个账号；"
+                         "为稳妥起见先退出登录再走完整流程")
+            self._sign_out()
 
         self._submit_email(email)
         self._submit_password(password)
@@ -350,6 +388,54 @@ class BrowserSession:
 
         self._wait_for_session()
         return self.refresh_credentials()
+
+    def _current_account_email(self) -> str | None:
+        """当前会话属于哪个账号；没有会话或问不出来时返回 ``None``。
+
+        在**页面里**发这个请求（同源、带浏览器自己的 Cookie），比在外面用
+        curl_cffi 更贴近"浏览器现在是谁"。问不出来就返回 None —— 调用方据此
+        走完整登录流程，而不是假设一切正常。
+        """
+        try:
+            email = self.page.evaluate(
+                """async () => {
+                    try {
+                        const r = await fetch('/backend-api/me',
+                                              {credentials: 'include'});
+                        if (!r.ok) return null;
+                        const j = await r.json();
+                        return (j && j.email) || null;
+                    } catch (e) { return null; }
+                }""")
+        except Exception:  # noqa: BLE001 - 导航中途/页面已关都会抛
+            return None
+        return email if isinstance(email, str) and email.strip() else None
+
+    def _sign_out(self) -> int:
+        """清掉登录态 Cookie，然后回到登录页。
+
+        保留 **Cloudflare 放行凭证**（``cf_clearance`` / ``__cf_bm`` / ``_cfuvid`` …）
+        与**设备标识**（``oai-did``）：清掉它们会平白再撞一次 Cloudflare，
+        甚至被当成新设备而触发风控。
+
+        其余一律清掉 —— **包括我们不认识的新 Cookie**。理由是不对称的：
+        "漏掉一个认证 Cookie"的后果是静默地继续用旧账号（就是刚修的这个 bug），
+        而"多清了一个"最多是让服务端重发一次。
+        """
+        cleared = 0
+        for cookie in self.read_cookies():
+            name = str(cookie.get("name") or "")
+            if not name or _is_kept_on_sign_out(name):
+                continue
+            try:
+                self._context.clear_cookies(name=name)
+                cleared += 1
+            except Exception:  # noqa: BLE001 - 单个删不掉不该中断
+                continue
+        self.log(f"已清除 {cleared} 个登录态 Cookie（保留 Cloudflare 放行凭证）")
+        self._goto(LOGIN_URL)
+        self._dismiss_cookie_banner()
+        return cleared
 
     def _is_logged_in(self) -> bool:
         return any(cookie["name"].startswith(SESSION_COOKIE_PREFIX)
@@ -378,8 +464,10 @@ class BrowserSession:
         """
         absolute = url if url.startswith("http") else HOME_URL.rstrip("/") + url
         self.log(f"把浏览器导航到被拦地址，以便渲染人机验证：{absolute[:100]}")
-        # 只试一次：这一步失败就直接交给上层报错，不必再重试
-        self._goto(absolute, attempts=1)
+        # 只试一次：这一步失败就直接交给上层报错，不必再重试。
+        # wait_cloudflare=False：这里的拦截页**正是要给用户看的**，
+        # 等它消解等于把用户要点的东西挡在门外。
+        self._goto(absolute, attempts=1, wait_cloudflare=False)
         try:
             self.page.bring_to_front()
         except Exception:  # noqa: BLE001 - 无头模式或已关闭时忽略
@@ -480,18 +568,69 @@ class BrowserSession:
         self.log(f"警告：输入框的值未能确认（当前 {current[:12]!r}）")
         return current == value
 
+    def _email_step_state(self) -> str:
+        """邮箱步骤现在处于什么状态。
+
+        ==============  ====================================================
+        返回值           含义
+        ==============  ====================================================
+        ``advanced``     已经进到下一步（出现密码框/验证码框，或邮箱框消失，
+                         或已经拿到会话）
+        ``submitting``   正在提交 —— 输入框和按钮都变灰了
+        ``idle``         还停在邮箱步骤，表单可用（= 这次提交没生效）
+        ==============  ====================================================
+        """
+        if self._is_logged_in():
+            return "advanced"
+        if self._find_visible(PASSWORD_SELECTORS, timeout_ms=300) is not None:
+            return "advanced"
+        if self._find_visible(CODE_SELECTORS, timeout_ms=300) is not None:
+            return "advanced"
+        field = self._find_visible(EMAIL_SELECTORS, timeout_ms=300)
+        if field is None:
+            return "advanced"          # 邮箱框没了，说明页面已经翻篇
+        try:
+            if not field.is_enabled():
+                return "submitting"    # 灰着 = 正在提交，**不是**失败
+        except Exception:  # noqa: BLE001 - 查询失败按提交中处理，宁可多等
+            return "submitting"
+        return "idle"
+
+    def _wait_for_email_accepted(self, *, timeout_s: float = 25.0) -> bool:
+        """等邮箱提交生效，返回是否真的推进到了下一步。
+
+        **为什么要这么写**：点「继续」之后，页面会进入一段 **disabled 的提交态**
+        （输入框和按钮都变灰），**几秒后**才导航到下一步。早先的实现只等固定
+        2.5 秒、再看"邮箱框还在不在"，于是把"正在提交"误判成"没提交成功" ——
+        白重试 3 次然后报"邮箱提交连续 3 次都没有推进"，而实际上第一次就成了。
+        （实测：点击后约 3 秒页面才导航走。）
+
+        所以这里改成轮询状态机：
+        * 变成 ``advanced`` → 成功；
+        * 先见到 ``submitting``、后来又回到 ``idle`` → 页面把表单还回来了，
+          这次确实没成，返回 False 让上层重试；
+        * 一直 ``idle`` 到超时 → 也返回 False。
+        """
+        started = time.monotonic()
+        saw_submitting = False
+        while time.monotonic() - started < timeout_s:
+            state = self._email_step_state()
+            if state == "advanced":
+                return True
+            if state == "submitting":
+                saw_submitting = True
+            elif saw_submitting:
+                self.log("提交态退回可编辑态 —— 这次提交没生效")
+                return False
+            self.page.wait_for_timeout(300)
+        return False
+
     def _email_step_still_showing(self) -> bool:
-        """判断是否仍停在邮箱这一步。
+        """判断是否仍停在邮箱这一步（等不到推进时的兜底判断）。
 
         原生 GET 提交的典型特征是 URL 带上了 ``?email=`` 且邮箱框又变回空的。
         """
-        if self._is_logged_in():
-            return False
-        password = self._find_visible(PASSWORD_SELECTORS, timeout_ms=800)
-        code = self._find_visible(CODE_SELECTORS, timeout_ms=800)
-        if password is not None or code is not None:
-            return False
-        return self._find_visible(EMAIL_SELECTORS, timeout_ms=800) is not None
+        return self._email_step_state() == "idle"
 
     def _submit_email(self, email: str) -> None:
         self.log("提交邮箱…")
@@ -509,9 +648,8 @@ class BrowserSession:
                     "找不到邮箱输入框。已把页面截图与 HTML 存到 "
                     f"{self.settings.debug_dir}，请据此判断登录页是否改版或被拦截。")
             self._click_submit(field)
-            self.page.wait_for_timeout(2500)
             self._raise_if_blocked("邮箱提交后被拦")
-            if not self._email_step_still_showing():
+            if self._wait_for_email_accepted():
                 self.log("邮箱已接受")
                 return
             self.log("仍停在邮箱步骤（疑似提交未生效）")
@@ -641,16 +779,24 @@ class BrowserSession:
             self.page.keyboard.press("Enter")
 
     def _goto(self, url: str, *, attempts: int = 3,
-              wait_until: str = "domcontentloaded") -> None:
+              wait_until: str = "domcontentloaded",
+              wait_cloudflare: bool = True) -> None:
         """带重试的导航。
 
         这个环境到 chatgpt.com 的链路会偶发 ``ERR_CONNECTION_TIMED_OUT``
         （实测过一次），一次失败就放弃会让整个登录流程白跑，所以这里退避重试。
+
+        ``wait_cloudflare``：导航后是否等 Cloudflare 的"请稍候…"拦截页消解。
+        默认等 —— 不等的话，后续会在一个还是拦截页的文档里找表单/等挑战，
+        报出来的错（"找不到邮箱输入框"）跟真实原因（被 CF 拦了）完全对不上。
+        只有"就是要让用户看见拦截页去点它"的场合（``open_for_challenge``）才传 False。
         """
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
                 self.page.goto(url, wait_until=wait_until)
+                if wait_cloudflare:
+                    self._wait_for_cloudflare()
                 return
             except Exception as exc:  # noqa: BLE001 - 网络类错误统一重试
                 last_error = exc
@@ -663,6 +809,61 @@ class BrowserSession:
             f"连续 {attempts} 次都无法打开 {url}。\n"
             f"最后一次错误：{last_error}\n"
             "请检查本机网络/代理是否可达 chatgpt.com。")
+
+    def _is_cloudflare_interstitial(self) -> bool:
+        """当前文档是不是 Cloudflare 的拦截页。"""
+        try:
+            return bool(self.page.evaluate("""() => {
+                const title = document.title || '';
+                if (/请稍候|Just a moment|Attention Required|Verifying you are human/i
+                        .test(title)) return true;
+                return !!document.querySelector('script[src*="challenge-platform"]');
+            }"""))
+        except Exception:  # noqa: BLE001 - 导航中途 evaluate 会失败
+            return False
+
+    def _wait_for_cloudflare(self, *, timeout_s: float = 300.0) -> bool:
+        """遇到 Cloudflare 拦截页时，**交给用户去点**。
+
+        ⚠️ 这个"请稍候…"是**需要人点一下**的挑战，**不会自己过去**。
+        （我一度以为它是托管挑战、浏览器能自己过 —— 那次观测里其实是用户
+        手动点掉的，属于把人的操作算到了程序头上。）
+
+        所以这里不能傻等，要做三件事：
+
+        1. 把窗口提到前台 —— 用户得看得见才点得到；
+        2. 明确告诉他"去点一下"（GUI 弹框 / CLI 回车确认，走 challenge_prompt）；
+        3. 一边等一边轮询拦截是否已消解，消解了才继续。
+
+        没有 ``challenge_prompt``（纯库调用）时只能轮询等外部有人点，
+        超时就如实报错，不假装成功。
+        """
+        if not self._is_cloudflare_interstitial():
+            return True
+
+        self.log("页面被 Cloudflare 拦住 —— 这个验证**需要你亲自点一下**，"
+                 "它不会自己过去")
+        try:
+            self.page.bring_to_front()
+        except Exception:  # noqa: BLE001 - 无头/已关闭时忽略
+            pass
+
+        started = time.monotonic()
+        asked = False
+        while time.monotonic() - started < timeout_s:
+            if not self._is_cloudflare_interstitial():
+                self.log(f"Cloudflare 验证已通过（等了 "
+                         f"{time.monotonic() - started:.0f} 秒）")
+                return True
+            if not asked and self.challenge_prompt is not None:
+                asked = True
+                if not self.challenge_prompt(self.page.url):
+                    self.log("已放弃这次 Cloudflare 验证")
+                    return False
+            self.page.wait_for_timeout(500)
+
+        self.log(f"警告：{timeout_s:.0f} 秒内 Cloudflare 验证仍未通过")
+        return False
 
     def _reload(self, *, attempts: int = 3,
                 wait_until: str = "domcontentloaded") -> None:

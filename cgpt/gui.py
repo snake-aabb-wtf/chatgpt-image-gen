@@ -376,10 +376,11 @@ class GuiApp:
         """在主线程里弹框询问（由事件泵调用）。"""
         ok = messagebox.askokcancel(
             "需要完成人机验证",
-            "被 Cloudflare 人机验证拦住，自动用浏览器重发也没过去。\n\n"
+            "被 Cloudflare 人机验证拦住 —— 这个验证**需要人点一下**，"
+            "不会自己过去。\n\n"
             f"浏览器窗口已打开在：\n{url}\n\n"
             "请在那个窗口里完成验证（一般点一下复选框就行），\n"
-            "完成后点「确定」—— 我会重读 Cookie 并自动重试。\n\n"
+            "完成后点「确定」继续。\n\n"
             "点「取消」则放弃本次操作。",
             parent=self.root)
         answer.put(ok)

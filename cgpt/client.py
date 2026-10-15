@@ -77,8 +77,9 @@ class Client:
         """用账密 + TOTP 登录并抓取凭据（会启动真实浏览器）。"""
         settings = settings or Settings()
         # 登录是用户主动点的，而且 Cloudflare 可能要他亲自处理 —— 正常显示窗口。
+        # challenge_prompt 一路传下去：登录过程中也可能撞上需要人工点的 CF 验证。
         session = BrowserSession(settings, headless=headless, minimized=False,
-                                 log=log)
+                                 challenge_prompt=challenge_prompt, log=log)
         session.start()
         client = cls(credentials=Credentials(), settings=settings,
                      browser=session, challenge_prompt=challenge_prompt,
@@ -156,10 +157,24 @@ class Client:
         if credentials.cookies:
             self.credentials.cookies = credentials.cookies
         self.credentials.captured_at = time.time()
-        if not self.credentials.bearer and credentials.bearer:
+
+        # 账号身份必须和 Cookie **成套**更新。
+        #
+        # 曾经的写法是"只在没有时才填"，于是一旦浏览器 profile 里的会话换了人
+        # （比如用户用另一个账号登录过），就会出现"account_id 还是旧的、Cookie
+        # 已经是新的"——而 account_id 会被当成 ``chatgpt-account-id`` 请求头发出去，
+        # 结果是**拿 A 的账号头配 B 的会话**，请求打到错误的账号上。
+        new_account = credentials.account_id
+        if new_account and new_account != self.credentials.account_id:
+            if self.credentials.account_id:
+                self.log(f"注意：浏览器里的会话属于另一个账号"
+                         f"（{self.credentials.account_id[:8]}… → "
+                         f"{new_account[:8]}…），已跟着换过去")
+            self.credentials.account_id = new_account
+            # bearer 也是绑定账号的，换了账号就不能留旧的
             self.credentials.bearer = credentials.bearer
-        if not self.credentials.account_id and credentials.account_id:
-            self.credentials.account_id = credentials.account_id
+        elif not self.credentials.bearer and credentials.bearer:
+            self.credentials.bearer = credentials.bearer
         self._web = None                      # 让客户端用新凭据重建
         if self.credentials.sentinel is None:
             self.log("警告：这一轮仍未抓到哨兵令牌，对话请求可能被拒")

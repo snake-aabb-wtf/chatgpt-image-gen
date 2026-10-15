@@ -66,10 +66,10 @@ def _challenge_prompt(url: str) -> bool:
     返回 True 表示"已经过验证了，可以重试"。
     """
     _echo("")
-    _echo("⚠ 被 Cloudflare 人机验证拦住，自动用浏览器重发也没过去。")
+    _echo("⚠ 被 Cloudflare 人机验证拦住 —— 这个验证**需要人点一下**，不会自己过去。")
     _echo(f"  浏览器窗口已打开在：{url}")
     _echo("  请在浏览器里完成验证（一般点一下复选框就行），")
-    _echo("  然后回到这里按回车 —— 我会重读 Cookie 并自动重试。")
+    _echo("  然后回到这里按回车继续。")
     if not sys.stdin.isatty():
         _echo("  当前不是交互终端，无法等待人工验证。")
         return False

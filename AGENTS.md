@@ -331,6 +331,56 @@ login                       → minimized=False                  用户主动点
 回归测试：`tools/gui_smoke.py`（真的走一遍菜单项，看控件里有没有东西，
 而不只是断言"菜单对象存在"）+ `tests/test_gui.py` 的菜单结构测试。
 
+### 3.12 换账号登录：四个连在一起的坑
+
+**故障现象**：profile 里已有账号 A，填账号 B 点「登录」——**还在用 A**，且不报错。
+
+根因在 `BrowserSession.login()`：
+
+```python
+if self._is_logged_in():
+    self.log("持久化 profile 里已有有效会话，跳过账号密码步骤")
+    return self.refresh_credentials()      # ← 拿的是 A 的凭据
+```
+
+`_is_logged_in()` 只看**有没有**会话 Cookie、不看它是谁的。修法是登录前先问清
+"当前会话是谁"（`_current_account_email()`，在**页面里**同源 fetch
+`/backend-api/me`）；不是这个账号就先 `_sign_out()`。
+**问不出来时不能赌** —— 一律走完整登录流程，宁可多走一遍也不能静默用旧账号。
+
+顺着这条线还踩出三个坑，每个都会单独造成"看起来登录了、其实是别人"：
+
+**① CF 拦截页需要人点，不会自己过去。**
+我一度以为它是托管挑战、浏览器能自己过 —— 那是把用户手动点的操作算到了程序头上。
+现在的 `_wait_for_cloudflare()` 会把窗口提到前台 + 走 `challenge_prompt` 问用户，
+而不是傻等。早先不等它，于是跑到拦截页里找登录表单，报"找不到邮箱输入框"，
+把真实原因完全掩盖。
+
+**② 提交后的 disabled 提交态不是失败。**
+点「继续」后页面会进入约 3 秒的**提交态**（输入框和按钮都变灰），然后才导航。
+早先只等固定 2.5 秒、再看"邮箱框还在不在"，于是把"正在提交"误判成"没提交成功"，
+白重试 3 次然后报"邮箱提交连续 3 次都没有推进" —— 而实际上第一次就成了。
+现在用状态机 `_email_step_state()`（`advanced`/`submitting`/`idle`）+
+`_wait_for_email_accepted()` 轮询判定。
+
+**③ 账号身份必须和 Cookie 成套更新。**
+`refresh_sentinel()` 原来是"account_id 只在没有时才填"，于是一旦浏览器里的会话
+换了人，就会出现"Cookie 是 B 的、account_id 还是 A 的"。而 account_id 会被当成
+`chatgpt-account-id` 请求头发出去 —— **拿 A 的账号头配 B 的会话**，请求打到错误
+的账号上。现在换账号时一并更新 account_id 与 bearer，并在日志里明说换人了。
+
+**登出保留什么**（`_is_kept_on_sign_out`）：只保留 Cloudflare 放行凭证
+（`cf_clearance` / `__cf*` / `_cf*`）与设备标识（`oai-did`）。其余**一律清掉，
+包括我们不认识的新 Cookie** —— 理由是不对称的：漏掉一个认证 Cookie 的后果是
+静默用旧账号，而多清一个最多是让服务端重发一次。
+
+**⚠️ 测试这个流程要克制。** 我为了验证连续做了七八次真实登录，直接把账号搞到
+CF 持续拦截、`/backend-api/me` 返回 429 —— **连人工点验证都过不去了**。
+真实登录属于"会触发风控"的操作，改这块代码时优先靠 `tests/test_account_switch.py`
+（44 项，全部用假件），联网验证最多走一遍。
+
+回归测试见 `tests/test_account_switch.py`。
+
 ---
 
 ## 4. 架构地图（按任务找文件）
