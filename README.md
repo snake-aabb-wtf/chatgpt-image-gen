@@ -380,3 +380,9 @@ docs/                  逆向分析报告 + 设计文档 + 验证报告
 | 接口清单（可照抄的调用参考） | `docs/04-ChatGPT-Web-接口清单.md` |
 | 本工具的设计文档 | `docs/superpowers/specs/2026-10-14-chatgpt-image-gen-tool-design.md` |
 | 实测验证报告 | `docs/验证报告-2026-10-14.md` |
+
+---
+
+## 许可
+
+[MIT](LICENSE)
