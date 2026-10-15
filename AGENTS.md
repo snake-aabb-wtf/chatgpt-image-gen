@@ -254,6 +254,55 @@ cgpt/api/image.py   generate_image 里先判"打没打算画图"，再决定轮�
 
 回归测试见 `tests/test_prompt_rejected.py`。
 
+### 3.10 后台开浏览器不能抢焦点
+
+**故障现象**：每次生图前刷新准入令牌都会弹浏览器窗口，并且**抢走焦点**，
+正在打字就被打断。
+
+**试过但不可行的两条路**（都实测过，别再走）：
+
+| 方案 | 结果 |
+|------|------|
+| `--start-minimized` | ❌ Playwright 自带的 "Google Chrome for Testing" **不认这个开关**，窗口照样弹出并成为前台 |
+| 无头（`headless=True`） | ❌ **抓不到令牌**。99.6s 后只拿到 23 个 Cookie、`Bearer 无`、`account_id` 是个 UA 串 —— 页面卡在 Cloudflare，哨兵 JS 根本没跑起来。（有头对照：13.1s，令牌齐） |
+
+**可行的做法**：启动后立刻用 Win32 `ShowWindow(hwnd, SW_MINIMIZE)` 按下去。
+
+实测最小化之后：
+
+* **焦点自动回到用户原来的窗口**；
+* 页面 JS 照常运行，令牌照样抓到（7.5s，比不最小化还快 —— 最小化**没有**把
+  渲染/定时器节流到影响结果）。
+
+三个必须守住的细节：
+
+1. **按 profile 路径定位进程**（`_win32_pids_using_profile`）。`EnumWindows` 只给
+   PID，而用户自己很可能也开着 Chrome、甚至也开着 chatgpt.com —— 不精确定位就有
+   把用户自己的窗口最小化掉的风险。查询走 PowerShell，记得
+   `creationflags=CREATE_NO_WINDOW`，否则会闪一个控制台窗口出来（比抢焦点还烦）。
+2. **最小化线程要和启动并行**（在 `launch_persistent_context` 之前起线程）。
+   窗口是在 launch 过程中就出现的，等 launch 返回再查进程已经晚了。
+   实测：串行 1.1s → 并行 0.8s。
+3. **`close()` 要立 `_closed` 旗**，最小化线程见到就收手。否则它会按 profile
+   找到**下一个**会话的窗口并最小化 —— 而下一个会话很可能正需要用户看见
+   （登录 / 人工过人机验证）。
+
+另外顺手加了 `--hide-crash-restore-bubble`：我们每次都是强制关浏览器，Chromium
+会认为"上次崩了"而弹一个"要恢复页面吗？"气泡，实测它会一起冒到前台。
+
+**谁能抢焦点、谁不能**：
+
+```
+refresh_sentinel / CF 回退   → ensure_browser(minimized=True)   最小化
+_solve_challenge            → ensure_browser(minimized=False)  必须可见（用户要点）
+login                       → minimized=False                  用户主动点的
+```
+
+`Settings.minimize_browser` 可以整体关掉。仅 Windows 生效，其它平台是 no-op。
+
+**实测结果**：焦点被抢时长从「整个刷新期（约 13s）」压到 **0.8s**，
+之后焦点自动归还用户窗口。
+
 ---
 
 ## 4. 架构地图（按任务找文件）

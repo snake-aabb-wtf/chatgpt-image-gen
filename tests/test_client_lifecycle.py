@@ -29,11 +29,14 @@ from cgpt.models import Credentials, SentinelTokens
 class FakeBrowser:
     """记录 start/close 调用的假浏览器会话。"""
 
-    def __init__(self, credentials: Credentials | None = None) -> None:
+    def __init__(self, credentials: Credentials | None = None, *,
+                 minimized: bool = False, **_kwargs) -> None:
         self.started = False
         self.close_count = 0
         self.refresh_count = 0
         self.fetch_count = 0
+        #: 与 BrowserSession 的接口保持一致（``Client.ensure_browser`` 会读它）
+        self.minimized = minimized
         self._credentials = credentials or Credentials(
             cookies={"__Secure-next-auth.session-token.0": "x"},
             bearer="b",
@@ -160,6 +163,137 @@ def test_release_browser_logs_only_once(tmp_path: Path, logs) -> None:
     client._release_browser()
     client._release_browser()
     assert sum("已关闭浏览器窗口" in line for line in logs) == 1
+
+
+# --- 后台开浏览器时要最小化（别抢焦点） ----------------------------------
+
+
+def test_background_open_is_minimized(tmp_path: Path, logs,
+                                      patch_browser_session) -> None:
+    """刷新令牌这类后台用途：窗口最小化，不抢用户焦点。"""
+    created = patch_browser_session(FakeBrowser)
+    client = _client_without_browser(logs, tmp_path)
+
+    client.ensure_browser()
+
+    assert created and created[0].ctor_kwargs.get("minimized") is True
+
+
+def test_explicit_visible_open_is_not_minimized(tmp_path: Path, logs,
+                                                patch_browser_session) -> None:
+    created = patch_browser_session(FakeBrowser)
+    client = _client_without_browser(logs, tmp_path)
+
+    client.ensure_browser(minimized=False)
+
+    assert created and created[0].ctor_kwargs.get("minimized") is False
+
+
+def test_challenge_solver_asks_for_a_visible_window(tmp_path: Path, logs,
+                                                    patch_browser_session) -> None:
+    """要用户点验证时必须让他看见 —— 最小化了就没法点。"""
+    created = patch_browser_session(FakeBrowser)
+    client = _client_without_browser(logs, tmp_path)
+    client.challenge_prompt = lambda _url: True
+
+    client._solve_challenge("https://chatgpt.com/x")
+
+    assert created, "应当开了浏览器"
+    assert all(b.ctor_kwargs.get("minimized") is False for b in created)
+
+
+def test_visible_need_replaces_a_minimized_session(tmp_path: Path, logs,
+                                                   patch_browser_session) -> None:
+    """手上是最小化的，但现在要用户看见 → 换一个可见的（而不是凑合用）。"""
+    created = patch_browser_session(FakeBrowser)
+    client = _client_without_browser(logs, tmp_path)
+
+    client.ensure_browser()                      # 最小化的
+    assert created[0].minimized is True
+    client.ensure_browser(minimized=False)       # 换成可见的
+
+    assert len(created) == 2, "应当重建了一个会话"
+    assert created[0].close_count == 1, "旧的应当被关掉"
+    assert created[1].minimized is False
+    assert any("重新以可见方式打开浏览器" in line for line in logs)
+
+
+def test_minimized_need_reuses_a_visible_session(tmp_path: Path, logs,
+                                                 patch_browser_session) -> None:
+    """反过来不必重建：可见的会话拿来当后台用也没问题。"""
+    created = patch_browser_session(FakeBrowser)
+    client = _client_without_browser(logs, tmp_path)
+
+    client.ensure_browser(minimized=False)
+    client.ensure_browser(minimized=True)
+
+    assert len(created) == 1, "可见的会话可以继续用，不该重建"
+
+
+# --- 最小化本身的边界（Win32 那部分只在 Windows 生效） -------------------
+
+
+def test_minimize_is_a_noop_off_windows(monkeypatch) -> None:
+    from cgpt.auth import browser as browser_module
+
+    monkeypatch.setattr(browser_module.sys, "platform", "linux")
+    session = browser_module.BrowserSession(Settings())
+    assert session._minimize_own_window(timeout=0.1) is False
+
+
+def test_minimize_stops_once_the_session_is_closed(monkeypatch) -> None:
+    """已关闭的会话**不能**再去找进程。
+
+    否则它会按 profile 路径找到**下一个**会话的窗口并把它最小化掉 ——
+    而下一个会话很可能正需要用户看见（登录 / 人工过人机验证）。
+    """
+    from cgpt.auth import browser as browser_module
+
+    monkeypatch.setattr(browser_module.sys, "platform", "win32")
+    lookups: list[object] = []
+    monkeypatch.setattr(browser_module, "_win32_pids_using_profile",
+                        lambda path: lookups.append(path) or {1234})
+
+    session = browser_module.BrowserSession(Settings())
+    session._closed = True
+
+    assert session._minimize_own_window(timeout=0.5) is False
+    assert lookups == [], "已关闭就不该再去查进程"
+
+
+def test_pid_lookup_survives_subprocess_failure(monkeypatch) -> None:
+    """定位进程失败不能把刷新带崩 —— 返回空集合即可。"""
+    from cgpt.auth import browser as browser_module
+
+    def boom(*_args, **_kwargs):
+        raise OSError("powershell 不见了")
+
+    monkeypatch.setattr(browser_module.subprocess, "run", boom)
+    assert browser_module._win32_pids_using_profile(Path(".")) == set()
+
+
+def test_pid_lookup_hides_the_console_window(monkeypatch) -> None:
+    """起 PowerShell 时不能让控制台窗口闪出来 —— 那比抢焦点还烦。"""
+    from cgpt.auth import browser as browser_module
+
+    seen: dict = {}
+
+    class Result:
+        stdout = "1234\n5678\nnot-a-pid\n"
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        seen["cmd"] = cmd
+        return Result()
+
+    monkeypatch.setattr(browser_module.subprocess, "run", fake_run)
+    pids = browser_module._win32_pids_using_profile(Path("C:/x/profile"))
+
+    assert pids == {1234, 5678}, "非数字行要忽略"
+    assert seen.get("creationflags") == browser_module.CREATE_NO_WINDOW
+    # 用 resolve() 之后的形式比 —— Windows 上分隔符会变成反斜杠
+    marker = str(Path("C:/x/profile").resolve())
+    assert marker in seen["cmd"][-1], "查询要按 profile 路径精确匹配"
 
 
 def test_ensure_sentinel_refreshes_stale_tokens_then_closes(tmp_path: Path,

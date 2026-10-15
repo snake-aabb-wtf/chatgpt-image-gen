@@ -14,6 +14,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,18 +97,71 @@ class _Captured:
     notes: list[str] = field(default_factory=list)
 
 
+#: 把窗口最小化（Win32 ``ShowWindow`` 的 ``SW_MINIMIZE``）
+SW_MINIMIZE = 6
+#: 别让 PowerShell 弹一个控制台窗口出来
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _win32_pids_using_profile(profile_dir: Path) -> set[int]:
+    """命令行里带该 profile 目录的进程号。
+
+    为什么非要按 profile 路径找：``EnumWindows`` 只能给出 PID，而用户自己
+    很可能也开着 Chrome（甚至也开着 chatgpt.com）。只有"命令行里带我们这个
+    ``--user-data-dir``"才能精确锁定本会话的浏览器 —— 否则就有把用户自己的
+    窗口最小化掉的风险。
+    """
+    marker = str(profile_dir.resolve()).replace("'", "''")
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{marker}') }} | "
+        "Select-Object -ExpandProperty ProcessId")
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, errors="replace", timeout=15,
+            creationflags=CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {int(line) for line in result.stdout.split() if line.strip().isdigit()}
+
+
+def _win32_visible_windows(pids: set[int]) -> list[tuple[int, bool]]:
+    """属于这些进程的可见顶层窗口：``(hwnd, 是否已最小化)``。"""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, bool]] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def callback(hwnd, _lparam):  # pragma: no cover - 由 Win32 回调
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids and user32.IsWindowVisible(hwnd):
+            found.append((hwnd, bool(user32.IsIconic(hwnd))))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found
+
+
 class BrowserSession:
     """Playwright 会话：负责登录、以及后续的凭据刷新与 CF 回退请求。"""
 
     def __init__(self, settings: Settings | None = None, *,
                  headless: bool | None = None,
+                 minimized: bool | None = None,
                  log: Callable[[str], None] | None = None) -> None:
         self.settings = settings or Settings()
         self.headless = self.settings.headless if headless is None else headless
+        if minimized is None:
+            minimized = self.settings.minimize_browser
+        self.minimized = minimized
         self.log = log or (lambda _message: None)
         self._playwright = None
         self._context = None
         self._page = None
+        self._closed = False
         self._captured = _Captured()
 
     # --- 生命周期 -----------------------------------------------------
@@ -126,6 +182,13 @@ class BrowserSession:
         profile_dir = Path(self.settings.profile_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = sync_playwright().start()
+        # 最小化要和启动**并行**跑：窗口是在 launch 过程中就出现的，
+        # 等 launch 返回再去查进程，用户已经多被抢了几百毫秒焦点。
+        minimizer: threading.Thread | None = None
+        if self.minimized and not self.headless:
+            minimizer = threading.Thread(target=self._minimize_own_window,
+                                         daemon=True)
+            minimizer.start()
         self._context = self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=self.headless,
@@ -134,6 +197,9 @@ class BrowserSession:
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
+                # 我们每次都是强制关掉浏览器的，Chromium 会认为"上次崩了"，
+                # 于是弹一个"要恢复页面吗？"的气泡。实测它会一起冒到前台。
+                "--hide-crash-restore-bubble",
             ],
             viewport={"width": 1440, "height": 900},
             locale="zh-CN",
@@ -144,12 +210,70 @@ class BrowserSession:
         self._page = (self._context.pages[0] if self._context.pages
                       else self._context.new_page())
         self._attach_page(self._page)
+        if minimizer is not None:
+            minimizer.join(timeout=8.0)
+
+    def _minimize_own_window(self, *, timeout: float = 10.0) -> bool:
+        """把本会话的浏览器窗口最小化，免得它抢走用户焦点（仅 Windows）。
+
+        为什么不用 ``--start-minimized``：**实测 Playwright 自带的
+        "Google Chrome for Testing" 不认这个开关**，窗口照样弹出来并成为前台。
+
+        为什么最小化而不是别的：实测最小化之后
+
+        * 焦点会**自动回到用户原来的窗口**；
+        * 页面 JS 照常运行，哨兵令牌照样抓到（7.5s，比不最小化还快）。
+
+        这个方法通常在**独立线程**里、与浏览器启动同时进行：一开始进程还不存在，
+        所以要轮询等它出现。全程尽力而为 —— 拿不到就只记一行日志，绝不因此
+        让刷新失败。
+        """
+        if not sys.platform.startswith("win"):
+            return False
+
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        profile_dir = Path(self.settings.profile_dir)
+        deadline = time.monotonic() + timeout
+        pids: set[int] = set()
+        looked_up = False
+
+        while time.monotonic() < deadline:
+            if self._closed:
+                # 会话已经关掉了。若还继续按 profile 找进程，就可能把**下一个**
+                # 会话的窗口最小化掉 —— 而下一个会话很可能正需要用户看见
+                # （登录 / 人工过人机验证）。所以必须在这里收手。
+                return False
+            if not pids:
+                pids = _win32_pids_using_profile(profile_dir)
+                looked_up = True
+                if not pids:
+                    # 每次查询要起一个 PowerShell（约 0.4s），别转得太密
+                    time.sleep(0.15)
+                    continue
+            windows = _win32_visible_windows(pids)
+            for hwnd, iconic in windows:
+                if not iconic:
+                    user32.ShowWindow(hwnd, SW_MINIMIZE)
+            if windows and all(iconic for _, iconic in windows):
+                self.log("已把浏览器窗口最小化（后台跑，不抢焦点）")
+                return True
+            time.sleep(0.05)
+
+        if looked_up and not pids:
+            self.log("没能定位到浏览器进程，窗口可能仍在前台")
+        elif pids:
+            self.log("浏览器窗口没能最小化，可能仍在前台")
+        return False
 
     def _attach_page(self, page) -> None:
         page.on("request", self._on_request)
         page.on("response", self._on_response)
 
     def close(self) -> None:
+        # 先立旗：最小化线程可能还在按 profile 找进程，别让它去动下一个会话的窗口
+        self._closed = True
         if self._context is not None:
             try:
                 self._context.close()

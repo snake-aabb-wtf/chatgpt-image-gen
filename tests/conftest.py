@@ -28,13 +28,19 @@ def patch_browser_session(monkeypatch) -> Callable[[type], list[Any]]:
         created = patch_browser_session(FakeBrowser)
         ...
         assert created[0].refresh_count == 1
+        assert created[0].ctor_kwargs["minimized"] is True
+
+    假件的构造参数会**原样透传**给 ``fake_class``，并记在 ``ctor_args`` /
+    ``ctor_kwargs`` 上 —— 这样才能断言"这次是按最小化开的还是按可见开的"。
     """
 
     def install(fake_class: type) -> list[Any]:
         created: list[Any] = []
 
-        def factory(*_args: Any, **_kwargs: Any) -> Any:
-            fake = fake_class()
+        def factory(*args: Any, **kwargs: Any) -> Any:
+            fake = fake_class(*args, **kwargs)
+            fake.ctor_args = args
+            fake.ctor_kwargs = kwargs
             created.append(fake)
             return fake
 

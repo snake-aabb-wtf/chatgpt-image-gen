@@ -49,10 +49,12 @@ class FakeBrowser:
 
     _serials = itertools.count(1)
 
-    def __init__(self) -> None:
+    def __init__(self, *_args, minimized: bool = False, **_kwargs) -> None:
         self.started = False
         self.refresh_count = 0
         self.close_count = 0
+        #: 与 BrowserSession 的接口保持一致（``Client.ensure_browser`` 会读它）
+        self.minimized = minimized
 
     def start(self) -> None:
         self.started = True

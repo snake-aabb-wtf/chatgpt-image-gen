@@ -215,10 +215,13 @@ def test_stream_does_not_fall_back_after_partial_output() -> None:
 
 
 class FakeBrowser:
-    def __init__(self, cookies: list[dict] | None = None) -> None:
+    def __init__(self, cookies: list[dict] | None = None, *,
+                 minimized: bool = False, **_kwargs) -> None:
         self.started = False
         self.navigated: list[str] = []
         self.close_count = 0
+        #: 与 BrowserSession 的接口保持一致（``Client.ensure_browser`` 会读它）
+        self.minimized = minimized
         self._cookies = cookies if cookies is not None else [
             {"name": "cf_clearance", "value": "fresh"},
             {"name": "__Secure-next-auth.session-token.0", "value": "s"},

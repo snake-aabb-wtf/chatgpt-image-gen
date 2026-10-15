@@ -55,6 +55,11 @@ class Settings(BaseModel):
     #: 生成图片的落盘目录。文件名由工具随机生成，不询问用户
     output_dir: Path = Path("output")
 
+    #: 后台开浏览器时（比如每次生图前刷新准入令牌）把它最小化，避免抢走焦点。
+    #: 需要用户亲自处理的场合（登录、人机验证）不受这个开关影响，始终正常显示。
+    #: 仅 Windows 生效 —— 其它平台没有等价的可靠做法。
+    minimize_browser: bool = True
+
     # --- 客户端标识头 ---
     originator: str = "chatgpt.com"
     oai_language: str = "zh-CN"

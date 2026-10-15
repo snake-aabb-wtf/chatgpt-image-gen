@@ -76,7 +76,9 @@ class Client:
               log: Callable[[str], None] | None = None) -> "Client":
         """用账密 + TOTP 登录并抓取凭据（会启动真实浏览器）。"""
         settings = settings or Settings()
-        session = BrowserSession(settings, headless=headless, log=log)
+        # 登录是用户主动点的，而且 Cloudflare 可能要他亲自处理 —— 正常显示窗口。
+        session = BrowserSession(settings, headless=headless, minimized=False,
+                                 log=log)
         session.start()
         client = cls(credentials=Credentials(), settings=settings,
                      browser=session, challenge_prompt=challenge_prompt,
@@ -111,16 +113,28 @@ class Client:
 
     # --- 浏览器（惰性） -----------------------------------------------
 
-    def ensure_browser(self) -> BrowserSession:
-        """按需启动浏览器。用于刷新哨兵令牌与 Cloudflare 回退。
+    def ensure_browser(self, *, minimized: bool = True) -> BrowserSession:
+        """按需启动浏览器。
+
+        ``minimized=True``（默认）用于**后台**用途 —— 刷新准入令牌、Cloudflare
+        回退。窗口会立刻最小化，不抢走用户焦点。
+        需要用户亲自处理时传 ``minimized=False``（登录、人工过人机验证），
+        窗口正常显示。
 
         ``start()`` 是幂等的（已启动则直接返回），所以这里**无条件调用** ——
         不能假设"``self._browser`` 非空就等于已经在跑"，那是个隐式不变量，
         一旦哪天有人在别处关掉会话却没置 None，就会变成难查的哑失败。
         """
+        if self._browser is not None and self._browser.minimized and not minimized:
+            # 手上这个是最小化的，但现在需要用户看见 —— 重建一个可见的。
+            # 不试图"恢复窗口"是因为那要额外碰 Win32，而这条路径很少走到
+            # （刷新完就关了，需要人工验证时通常是新建会话）。
+            self.log("需要用户查看，重新以可见方式打开浏览器…")
+            self._release_browser()
         if self._browser is None:
             self.log("启动浏览器（用于刷新准入令牌 / Cloudflare 回退）…")
-            self._browser = BrowserSession(self.settings, log=self.log)
+            self._browser = BrowserSession(self.settings, minimized=minimized,
+                                           log=self.log)
             self._owns_browser = True
         self._browser.start()
         return self._browser
@@ -235,7 +249,8 @@ class Client:
         if self.challenge_prompt is None:
             return False
         try:
-            session = self.ensure_browser()
+            # 这里**必须**让用户看见：他得在窗口里点验证。所以不最小化。
+            session = self.ensure_browser(minimized=False)
             session.open_for_challenge(url)
         except Exception as exc:  # noqa: BLE001 - 打不开浏览器就如实失败
             self.log(f"无法为人工验证打开浏览器：{exc!r}")
