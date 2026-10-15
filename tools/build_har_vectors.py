@@ -244,10 +244,49 @@ def build() -> dict[str, Any]:
     return vectors
 
 
+#: 仓库里**不带**的抓包（超过 GitHub 单文件 100 MB 上限，本地归档保留）。
+#: 缺了它就无法重建真值 —— 所以要**明确报错**，而不是安静地生成残缺真值。
+ABSENT_BY_DESIGN: dict[str, str] = {
+    "chatgpt_login.har": (
+        "111.7 MB，超过 GitHub 单文件 100 MB 上限，因此不入库。\n"
+        "     它是本项目最核心的证据来源（TOTP 轮次、PoW、XOR 密钥都取自这里），\n"
+        "     缺了它无法重建真值。请把本地归档放回 legacy/har/ 再跑本脚本。"),
+}
+
+
+def _require_all_present(filenames: set[str]) -> None:
+    """缺抓包就**拒绝继续**，绝不写出一份残缺的真值。
+
+    早先只是打印一行"跳过"然后照常写文件 —— 那会安静地产出一份少了核心向量的
+    fixture，而 ``cgpt selftest`` 正是靠它证明 Sentinel 实现是对的。
+    宁可不写，也不能写一份"看起来成功"的假真值。
+    """
+    missing = [name for name in sorted(filenames) if not (HAR_DIR / name).exists()]
+    if not missing:
+        return
+    lines = ["缺少抓包文件，无法重建真值：", ""]
+    for name in missing:
+        reason = ABSENT_BY_DESIGN.get(name)
+        lines.append(f"  - {name}")
+        if reason:
+            lines.append(f"     {reason}")
+        else:
+            lines.append(f"     期望位置：{HAR_DIR / name}")
+    lines += [
+        "",
+        "已有的真值仍在 cgpt/data/har_vectors.json（随包发布），",
+        "所以 `python -m cgpt selftest` 不受影响；只有**重建**才需要原始抓包。",
+    ]
+    print("\n".join(lines), file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", action="store_true", help="只打印摘要，不写文件")
     args = parser.parse_args()
+
+    _require_all_present(set(TARGET_ENTRIES))
 
     started = time.time()
     vectors = build()

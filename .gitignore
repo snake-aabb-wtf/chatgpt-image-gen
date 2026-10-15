@@ -4,6 +4,12 @@
 # 生成的图片
 output/
 
+# 超大抓包：111.7 MB，超过 GitHub 单文件 100 MB 上限，不入库（本地归档保留）。
+# 它是核心证据来源，缺了无法重建真值 —— 见 tools/build_har_vectors.py 的
+# ABSENT_BY_DESIGN 与 legacy/README.md。已随包发布的 cgpt/data/har_vectors.json
+# 不受影响，`python -m cgpt selftest` 照常可跑。
+legacy/har/chatgpt_login.har
+
 # Python
 __pycache__/
 *.py[cod]

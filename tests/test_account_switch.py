@@ -104,7 +104,10 @@ class FakePage:
     def evaluate(self, script, *_args):
         if "backend-api/me" in script:
             return self.current_email
-        return self._interstitial          # _is_cloudflare_interstitial
+        # 必须是 _cloudflare_state 认得的**状态字符串**。早先这里返回布尔值，
+        # 于是 `== "ready"` 永不成立，_goto 里的等待一路空转到 300 秒超时 ——
+        # 把本该 1 秒跑完的测试拖成了 25 分钟。
+        return "challenge" if self._interstitial else "ready"
 
     def wait_for_timeout(self, _ms):
         pass
@@ -278,10 +281,32 @@ def test_wait_succeeds_once_the_interstitial_clears() -> None:
         if "backend-api/me" in script:
             return original(script, *args)
         calls["n"] += 1
-        return calls["n"] < 3          # 第 3 次查询时已经不拦截了
+        # 前两次还是挑战页，第三次开始已经是正常页面
+        return "challenge" if calls["n"] < 3 else "ready"
 
     page.evaluate = evaluate
     assert session._wait_for_cloudflare(timeout_s=5.0) is True
+
+
+def test_cloudflare_state_rejects_unexpected_values() -> None:
+    """假件（或将来页面改版）返回意料之外的值时，按"还没好"处理。
+
+    不能因为拿到一个不认得的值就当成"已通过" —— 那会让流程冲进一个还在
+    加载的页面；也不能默默等到超时而不留痕迹。
+    """
+    page = FakePage()
+    session = _session(page)
+    for bogus in (True, False, None, 0, "READY", ""):
+        page.evaluate = lambda _script, _bogus=bogus, **_kw: _bogus
+        assert session._cloudflare_state() == "loading", f"{bogus!r} 应被拒"
+
+
+def test_cloudflare_state_accepts_the_three_real_values() -> None:
+    page = FakePage()
+    session = _session(page)
+    for value in ("challenge", "loading", "ready"):
+        page.evaluate = lambda _script, _value=value, **_kw: _value
+        assert session._cloudflare_state() == value
 
 
 def test_wait_without_prompt_does_not_pretend_to_succeed() -> None:

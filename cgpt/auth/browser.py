@@ -810,19 +810,37 @@ class BrowserSession:
             f"最后一次错误：{last_error}\n"
             "请检查本机网络/代理是否可达 chatgpt.com。")
 
-    def _is_cloudflare_interstitial(self) -> bool:
-        """当前文档是不是 Cloudflare 的拦截页。"""
+    def _cloudflare_state(self) -> str:
+        """当前文档处于什么状态：``challenge`` / ``loading`` / ``ready``。
+
+        ⚠️ 早先只判"**是不是**挑战页"，于是**导航途中**（标题还空着、挑战标记
+        也还没出现）被判成"已通过" —— 我们兴冲冲去提交邮箱，而挑战页下一秒才
+        真正加载完。用户看到的现象就是"点了又有"。
+        所以这里必须要求**正面证据**：真的加载出内容了才算 ``ready``。
+        """
         try:
-            return bool(self.page.evaluate("""() => {
+            state = self.page.evaluate("""() => {
                 const title = document.title || '';
                 if (/请稍候|Just a moment|Attention Required|Verifying you are human/i
-                        .test(title)) return true;
-                return !!document.querySelector('script[src*="challenge-platform"]');
-            }"""))
+                        .test(title)) return 'challenge';
+                if (document.querySelector('script[src*="challenge-platform"]'))
+                    return 'challenge';
+                const body = document.body;
+                if (!body || body.childElementCount === 0) return 'loading';
+                return 'ready';
+            }""")
         except Exception:  # noqa: BLE001 - 导航中途 evaluate 会失败
-            return False
+            return "loading"          # 查不出来就按"还没好"处理，宁可多等
+        # 白名单：拿到意料之外的值（比如假件返回了布尔）一律按"还没好"处理。
+        # 否则会静默地一路等到超时 —— 实测这个坑把测试从 1 秒拖到 25 分钟。
+        return state if state in ("challenge", "loading", "ready") else "loading"
 
-    def _wait_for_cloudflare(self, *, timeout_s: float = 300.0) -> bool:
+    def _is_cloudflare_interstitial(self) -> bool:
+        """当前文档是不是 Cloudflare 的拦截页。"""
+        return self._cloudflare_state() == "challenge"
+
+    def _wait_for_cloudflare(self, *, timeout_s: float = 300.0,
+                             reask_after_s: float = 60.0) -> bool:
         """遇到 Cloudflare 拦截页时，**交给用户去点**。
 
         ⚠️ 这个"请稍候…"是**需要人点一下**的挑战，**不会自己过去**。
@@ -833,12 +851,15 @@ class BrowserSession:
 
         1. 把窗口提到前台 —— 用户得看得见才点得到；
         2. 明确告诉他"去点一下"（GUI 弹框 / CLI 回车确认，走 challenge_prompt）；
-        3. 一边等一边轮询拦截是否已消解，消解了才继续。
+        3. 一边等一边轮询**直到页面真正加载出内容**，中途的导航/空文档都算没完。
+
+        挑战有时会**连着来**（过了一个又弹一个），所以用户说"点完了"之后如果
+        仍在挑战页，隔一段时间会**再问一次**，而不是默默等超时。
 
         没有 ``challenge_prompt``（纯库调用）时只能轮询等外部有人点，
         超时就如实报错，不假装成功。
         """
-        if not self._is_cloudflare_interstitial():
+        if self._cloudflare_state() == "ready":
             return True
 
         self.log("页面被 Cloudflare 拦住 —— 这个验证**需要你亲自点一下**，"
@@ -849,14 +870,19 @@ class BrowserSession:
             pass
 
         started = time.monotonic()
-        asked = False
+        last_ask: float | None = None
         while time.monotonic() - started < timeout_s:
-            if not self._is_cloudflare_interstitial():
+            if self._cloudflare_state() == "ready":
                 self.log(f"Cloudflare 验证已通过（等了 "
                          f"{time.monotonic() - started:.0f} 秒）")
                 return True
-            if not asked and self.challenge_prompt is not None:
-                asked = True
+            now = time.monotonic()
+            if (self.challenge_prompt is not None
+                    and (last_ask is None or now - last_ask >= reask_after_s)):
+                first = last_ask is None
+                last_ask = now
+                if not first:
+                    self.log("仍在 Cloudflare 验证页 —— 可能还需要再点一次")
                 if not self.challenge_prompt(self.page.url):
                     self.log("已放弃这次 Cloudflare 验证")
                     return False
