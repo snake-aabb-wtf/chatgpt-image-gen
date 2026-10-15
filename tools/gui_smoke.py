@@ -79,6 +79,65 @@ def main() -> int:
             app._submit = original_submit
         return bool(warned) and not submitted
 
+    def menu_labels(menu) -> list[str]:
+        """菜单里的命令项标签（跳过分隔线）。"""
+        end = menu.index("end")
+        if end is None:
+            return []
+        return [menu.entrycget(i, "label") for i in range(end + 1)
+                if menu.type(i) == "command"]
+
+    def invoke(menu, label: str) -> bool:
+        end = menu.index("end")
+        for i in range(end + 1 if end is not None else 0):
+            if menu.type(i) == "command" and menu.entrycget(i, "label") == label:
+                menu.invoke(i)
+                return True
+        return False
+
+    def set_clipboard(text: str) -> None:
+        app.root.clipboard_clear()
+        app.root.clipboard_append(text)
+        app.root.update()
+
+    def paste_via_menu(entry, menu) -> str:
+        """走一遍"右键 → 粘贴"，返回控件里实际得到的内容。"""
+        set_clipboard(LINE)
+        entry.delete(0, "end")
+        app.root.update()
+        invoke(menu, "粘贴")
+        app.root.update()
+        return entry.get()
+
+    def select_all_works(entry) -> bool:
+        entry.delete(0, "end")
+        entry.insert(0, LINE)
+        # 必须先给焦点：Tk 的 event_generate 对**未聚焦**控件不会触发键盘绑定
+        # （真实使用里用户会先点进输入框，所以这不影响功能）
+        entry.focus_force()
+        app.root.update()
+        entry.event_generate("<Control-a>")
+        app.root.update()
+        return bool(entry.selection_present())
+
+    def masked_copy_is_safe() -> bool:
+        """掩码状态下复制，剪贴板拿到的应当是圆点而不是明文。"""
+        entry = app.account_entry
+        entry.configure(show="•")
+        entry.delete(0, "end")
+        entry.insert(0, LINE)
+        app.root.update()
+        set_clipboard("")
+        entry.event_generate("<<SelectAll>>")
+        app.root.update()
+        invoke(app.account_menu, "复制")
+        app.root.update()
+        try:
+            copied = app.root.clipboard_get()
+        except Exception:  # noqa: BLE001 - 剪贴板空
+            return False
+        return bool(copied) and copied != LINE and set(copied) <= {"•"}
+
     try:
         app = gui.GuiApp(settings=settings, account_path=account_path)
     except Exception as exc:  # noqa: BLE001
@@ -116,6 +175,24 @@ def main() -> int:
                                              app.check_button,
                                              app.generate_button)))
         check("日志区只读", app.log_text.cget("state") == "disabled")
+
+        # --- 右键菜单（Tk 默认没有，必须自己挂）-------------------------
+        # 不满足于"菜单对象存在"：真的走一遍菜单项，看控件里有没有东西。
+        check("账号框有右键菜单",
+              "粘贴" in menu_labels(app.account_menu),
+              str(menu_labels(app.account_menu)))
+        check("右键粘贴真的能用", paste_via_menu(app.account_entry,
+                                                app.account_menu) == LINE,
+              repr(app.account_var.get())[:40])
+        check("Ctrl+A 全选能用", select_all_works(app.account_entry))
+        # 只读区不该出现"按了没反应"的项
+        log_labels = menu_labels(app.log_menu)
+        check("只读日志菜单只有复制/全选",
+              "复制" in log_labels and "粘贴" not in log_labels
+              and "剪切" not in log_labels,
+              str(log_labels))
+        # 掩码状态下复制不能把明文放进剪贴板
+        check("掩码框复制不泄漏明文", masked_copy_is_safe())
 
         # 忙碌态应禁用按钮（防止重复登录触发风控 / 重复生图白耗额度）
         app._set_busy(True, "登录")

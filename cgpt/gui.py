@@ -76,6 +76,64 @@ WINDOW_TITLE = "ChatGPT 生图工具"
 PREVIEW_BOX = (430, 430)
 MAX_LOG_LINES = 2000
 
+#: 右键菜单项：``(标签, Tk 虚拟事件, 是否只在可编辑时出现)``。
+#: 这些虚拟事件在 ttk.Entry 与 tk.Text 上都实测可用（见 tools/gui_smoke.py）。
+_EDIT_MENU_ITEMS: tuple[tuple[str, str, bool], ...] = (
+    ("剪切", "<<Cut>>", True),
+    ("复制", "<<Copy>>", False),
+    ("粘贴", "<<Paste>>", True),
+    ("删除", "<<Clear>>", True),
+    ("-", "", False),
+    ("全选", "<<SelectAll>>", False),
+)
+
+#: 右键在不同平台上是不同的事件
+_RIGHT_CLICK_SEQUENCES = ("<Button-3>", "<Button-2>", "<Control-Button-1>")
+
+
+def attach_edit_menu(widget: tk.Misc, *, editable: bool = True) -> tk.Menu:
+    """给 Entry / Text 挂上右键菜单。
+
+    **Tk 默认不提供右键菜单** —— 这是 Tk 的缺口，不是哪里配错了。而本工具最
+    核心的动作就是"把一整行账密粘进来"，没有右键粘贴很难用。
+
+    ``editable=False``（日志区那种只读控件）只保留复制/全选，不会给出粘贴这种
+    按了没反应的项。
+
+    顺带绑上 ``Ctrl+A``：Tk 在 Windows 上**不**默认提供它，而"全选后粘贴覆盖"
+    恰恰是换账号时最常见的动作。
+    """
+    menu = tk.Menu(widget, tearoff=False)
+    for label, virtual_event, needs_editable in _EDIT_MENU_ITEMS:
+        if label == "-":
+            menu.add_separator()
+            continue
+        if needs_editable and not editable:
+            continue
+        menu.add_command(
+            label=label,
+            command=lambda event=virtual_event: widget.event_generate(event))
+
+    def popup(event: tk.Event) -> str:
+        try:
+            widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            # 不 release 的话菜单会一直抓着鼠标，点别处没反应
+            menu.grab_release()
+        return "break"          # 别再往上传，免得触发别的默认行为
+
+    for sequence in _RIGHT_CLICK_SEQUENCES:
+        widget.bind(sequence, popup, add="+")
+
+    if editable:
+        for sequence in ("<Control-a>", "<Control-A>"):
+            widget.bind(sequence,
+                        lambda _e: (widget.event_generate("<<SelectAll>>"),
+                                    "break")[1],
+                        add="+")
+    return menu
+
 
 @dataclass
 class SessionInfo:
@@ -183,6 +241,8 @@ class GuiApp:
                                        show="•")
         self.account_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.account_entry.bind("<Return>", lambda _e: self.on_login())
+        # 这里最需要右键粘贴：整行账密是粘进来的，不是敲进来的
+        self.account_menu = attach_edit_menu(self.account_entry)
 
         self.login_button = ttk.Button(frame, text="登  录", width=10,
                                        command=self.on_login)
@@ -236,6 +296,7 @@ class GuiApp:
         # Ctrl+Enter 发送（单独 Enter 留给换行）
         self.prompt_text.bind("<Control-Return>",
                               lambda _e: (self.on_generate(), "break")[1])
+        self.prompt_menu = attach_edit_menu(self.prompt_text)
 
         row_frame = ttk.Frame(frame)
         row_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -277,6 +338,8 @@ class GuiApp:
         self.log_text = tk.Text(log_frame, wrap="word", state="disabled",
                                 height=12)
         self.log_text.grid(row=0, column=0, sticky="nsew")
+        # 只读：只给复制/全选，不出粘贴这种按了没反应的项
+        self.log_menu = attach_edit_menu(self.log_text, editable=False)
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical",
                                   command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")

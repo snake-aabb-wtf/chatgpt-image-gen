@@ -334,3 +334,64 @@ def test_challenge_prompt_event_carries_a_reply_queue(app) -> None:
         app._ask_challenge = original
 
     assert seen and seen[0][0] == "https://x"
+
+
+# --- 右键菜单（Tk 默认没有） ----------------------------------------------
+
+
+def menu_labels(menu) -> list[str]:
+    end = menu.index("end")
+    if end is None:
+        return []
+    return [menu.entrycget(i, "label") for i in range(end + 1)
+            if menu.type(i) == "command"]
+
+
+def test_editable_menu_has_the_full_set(app) -> None:
+    labels = menu_labels(app.account_menu)
+    assert labels == ["剪切", "复制", "粘贴", "删除", "全选"]
+
+
+def test_readonly_menu_drops_write_items(app) -> None:
+    """只读区不能给"按了没反应"的项。"""
+    labels = menu_labels(app.log_menu)
+    assert labels == ["复制", "全选"]
+    assert "粘贴" not in labels
+    assert "剪切" not in labels
+
+
+def test_prompt_box_also_has_a_menu(app) -> None:
+    assert "粘贴" in menu_labels(app.prompt_menu)
+
+
+@pytest.mark.parametrize("attribute", ["account_entry", "prompt_text", "log_text"])
+def test_right_click_is_bound(app, attribute: str) -> None:
+    """三个控件都要绑上右键，否则菜单根本弹不出来。"""
+    widget = getattr(app, attribute)
+    assert widget.bind("<Button-3>"), f"{attribute} 没绑右键"
+
+
+def test_menu_tearoff_is_off(app) -> None:
+    """不要那条虚线撕下菜单 —— 对本工具没有意义，还容易误点。"""
+    assert app.account_menu.cget("tearoff") in (0, False, "0")
+
+
+def test_ctrl_a_binding_is_registered(app) -> None:
+    """Tk 在 Windows 上不默认提供 Ctrl+A，得自己绑。"""
+    assert app.account_entry.bind("<Control-a>")
+    assert app.prompt_text.bind("<Control-a>")
+
+
+def test_readonly_widget_has_no_ctrl_a_binding(app) -> None:
+    """日志区不可编辑，绑全选没有意义（复制靠鼠标选中即可）。"""
+    assert not app.log_text.bind("<Control-a>")
+
+
+def test_attach_edit_menu_returns_usable_menu(app) -> None:
+    widget = tk.Entry(app.root)
+    try:
+        menu = gui.attach_edit_menu(widget)
+        assert "粘贴" in menu_labels(menu)
+        assert widget.bind("<Button-3>")
+    finally:
+        widget.destroy()
